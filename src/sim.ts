@@ -825,7 +825,7 @@ export class World {
       for (const e of this.edges) {
         if (e.to !== d.id) continue;
         const p = this.node(e.from);
-        if (!p) continue;
+        if (!p || p.downFor > 0) continue;
         if (p.kind === 'database') { conns += 1; continue; } // replication stream
         const need = total(e.rps) * (d.resp / 1000);
         const vc = Math.max(2, this.tierOf(p).vcpu);
