@@ -190,7 +190,7 @@ export function installSaveAndSandbox(host: Host) {
       const waveEnded = lastPhase === 'run' && w.phase === 'build';
       lastPhase = w.phase;
       if (w.phase !== 'build') return;
-      const sig = structureSig(w);
+      const sig = structureSig(w) + '|' + host.lessonsSeen.size; // lessons count too, so a seen lesson isn't shown again after reload
       if (sig !== lastSig) { lastSig = sig; dirtyAt = now; }
       if (waveEnded || (dirtyAt && now - dirtyAt > BUILD_DEBOUNCE_MS)) save();
     } else {

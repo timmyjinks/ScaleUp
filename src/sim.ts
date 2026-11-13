@@ -197,7 +197,7 @@ export class World {
   burn() { return this.nodes.reduce((a, n) => a + (this.phase === 'run' ? n.stats.cost : this.tierOf(n).cost + this.poolerCost(n)), 0); }
 
   /** concurrent users the dataset has to serve this wave (data only grows) */
-  peakUsers() { return this.wave.peakRps * USERS_PER_RPS; }
+  peakUsers() { return this.wave.users ?? this.wave.peakRps * USERS_PER_RPS; }
 
   /** DB working set (GB) a given primary/replica has to hold: hot rows + indexes for its shard */
   workingSet() {

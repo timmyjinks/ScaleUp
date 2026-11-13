@@ -139,6 +139,8 @@ export interface WaveDef {
   mix: Mix; // fractions of legit traffic (s+r+w = 1); b = bots as multiple of legit
   event?: WaveEvent;
   chaos: number; // probability per second of a random instance failure
+  /** concurrent users the dataset is sized for; defaults to peakRps * USERS_PER_RPS */
+  users?: number;
   title: string;
 }
 

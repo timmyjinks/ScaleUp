@@ -248,7 +248,7 @@ function refreshHud() {
   setStat('s-wave', `${world.waveNum}`, running ? `${w.title} · ${Math.max(0, Math.ceil(w.duration - world.time))}s left` : `next: ${w.title}`);
   setStat('s-users', running ? fmt(m.demand * USERS_PER_RPS) : fmt(w.peakRps * USERS_PER_RPS),
     running ? `${fmt(m.demand)} req/s` : `peak ${fmt(w.peakRps)} req/s incoming`);
-  setStat('s-p99', running ? ms(m.p99) : '—', running ? `p50 ${ms(m.p50)}` : `SLA < ${SLA.p99}ms`,
+  setStat('s-p99', running && m.success > 0.01 ? ms(m.p99) : '—', running ? `p50 ${ms(m.p50)}` : `SLA < ${SLA.p99}ms`,
     !running ? '' : m.p99 > SLA.p99 ? 'bad' : m.p99 > SLA.p99 * 0.6 ? 'warn' : 'good');
   setStat('s-err', running ? (m.errorRate * 100).toFixed(m.errorRate < 0.1 ? 2 : 1) + '%' : '—', running ? `${fmt(m.errors)} failing/s${m.staleRate > 0.005 ? ` · ${(m.staleRate * 100).toFixed(1)}% stale reads` : ''}` : `SLA < ${SLA.errorRate * 100}%`,
     !running ? '' : m.errorRate > SLA.errorRate ? 'bad' : m.errorRate > SLA.errorRate / 3 ? 'warn' : 'good');
@@ -504,7 +504,7 @@ function wireWorld() {
         <p><b>${next.title}</b>: peak <b>${fmt(next.peakRps)} req/s</b> (~${fmt(next.peakRps * USERS_PER_RPS)} users), ${Math.round(next.peakRps / waveRps(r.wave) * 100 - 100)}% more than this wave.
         Mix: ${Math.round(next.mix.s * 100)}% static · ${Math.round(next.mix.r * 100)}% reads · ${Math.round(next.mix.w * 100)}% writes${next.mix.b ? ` · <span class="c-b">+${next.mix.b * 100}% bots</span>` : ''}.</p>
         ${next.event ? `<p class="c-b">⚠ ${next.event.label}</p>` : ''}
-        ${next.chaos > 0 ? `<p style="color:var(--muted)">Random server crashes are on.</p>` : ''}</div>`,
+        ${next.chaos > 0 ? `<p style="color:var(--muted)">Random instance failures are on (servers and caches).</p>` : ''}</div>`,
       [{ label: 'Build phase →', primary: true, onClick: () => { maybeShowLesson(); } }]);
   };
   world.onGameOver = () => {

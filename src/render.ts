@@ -60,6 +60,8 @@ export class Renderer {
     const full = this.canvas.getBoundingClientRect();
     // leave room for the HUD, palette, side panel and charts
     const inset = { l: 230, r: 330, t: 90, b: 150 };
+    const sb = document.getElementById('sandbox'); // sandbox panel sits right of the palette
+    if (sb && !sb.classList.contains('hidden')) inset.l = Math.max(inset.l, sb.getBoundingClientRect().right - full.left + 20);
     const r = { width: full.width - inset.l - inset.r, height: full.height - inset.t - inset.b };
     const minX = Math.min(...ns.map((n) => n.x)) - 80, maxX = Math.max(...ns.map((n) => n.x + NODE_W)) + 80;
     const minY = Math.min(...ns.map((n) => n.y)) - 80, maxY = Math.max(...ns.map((n) => n.y + NODE_H)) + 80;

@@ -135,6 +135,7 @@ export class Sandbox {
     // this wave, so peakRps * waveShape(...) == target exactly: steady, flat traffic.
     const shape = waveShape({ ...wave, event: undefined }, t) || 1;
     wave.peakRps = (this.targetRps() * this.spikeMult(t)) / shape;
+    wave.users = this.targetRps() * USERS_PER_RPS; // size the dataset for the slider, not the inflated peak (spikes don't grow data)
     w.money = MONEY;
     if (w.reputation < REP_FLOOR) w.reputation = REP_FLOOR;
   }
