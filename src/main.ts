@@ -1,6 +1,7 @@
 import './style.css';
 import { CACHE_STRATEGIES, GEO, PALETTE_ORDER, RESIZE_S, SLA, SPECS, TICK, UNLOCKS, USERS_PER_RPS, waveRps } from './config';
 import { advise } from './advisor';
+import { fieldGuideButtonHtml, guideButtonHtml, initGuide, lessonDiagramsHtml, mountMiniDiagrams, setPlacingHint } from './guideview';
 import { NODE_H, NODE_W, Renderer, drawIcon, type ViewState } from './render';
 import { World, fmt } from './sim';
 import { LESSONS, QUICKSTART, type Lesson } from './tutorial';
@@ -57,7 +58,7 @@ function buildPalette() {
     b.appendChild(ico);
     b.insertAdjacentHTML('beforeend', `<span class="meta"><b>${spec.label}</b><small></small></span><span class="key">${i + 1}</span>`);
     b.onclick = () => startPlacing(kind);
-    b.onmouseenter = () => { b.title = spec.blurb; };
+    b.dataset.kind = kind; // hover card: guideview.ts
     p.appendChild(b);
     toolButtons.set(kind, b);
   });
@@ -315,6 +316,7 @@ function refreshInspector() {
       ${settingsHtml(n)}
       <p>${spec.blurb}</p>
       <div class="connects"><b>How to wire:</b> ${spec.wiring}</div>
+      ${guideButtonHtml(n.kind)}
       ${isUsers ? '' : `
       <table class="tiers">${spec.tiers.map((t, i) => `<tr class="${i === n.tier ? 'cur' : ''}" ${i === n.tier ? '' : `data-act="tier" data-v="${i}" title="Resize to ${t.name}${restart}"`}><td>${i === n.tier ? '▸' : ' '}</td><td>${t.name}</td><td>${t.vcpu ? `${t.vcpu}c/${t.ram}G` : ''}</td><td>${fmt(t.cap)}</td><td>${money(t.cost)}${t.perM ? '+' : ''}</td></tr>`).join('')}</table>
       <div class="row">
@@ -441,6 +443,7 @@ function modal(html: string, actions: { label: string; primary?: boolean; onClic
   const m = $('#modal');
   const card = m.querySelector('.card')!;
   card.innerHTML = html + `<div class="actions"></div>`;
+  mountMiniDiagrams(card);
   const row = card.querySelector('.actions')!;
   for (const a of actions) {
     const b = document.createElement('button');
@@ -462,6 +465,7 @@ function lessonHtml(wave: number, l: Lesson) {
   return `<div class="eyebrow">Wave ${wave}${l.tools?.length ? ' · new tools' : ''}</div><h2>${l.title}</h2>
     ${chips ? `<div class="chips">${chips}</div>` : ''}
     ${l.body.map((p) => `<p>${p}</p>`).join('')}
+    ${lessonDiagramsHtml(l.tools ?? [])}
     ${l.interview ? `<div class="tip"><b>Interview angle:</b> ${l.interview}</div>` : ''}`;
 }
 
@@ -477,7 +481,7 @@ function showLessonIndex() {
   const items = Object.entries(LESSONS).filter(([w]) => Number(w) <= world.waveNum)
     .map(([w, l]) => `<button class="btn" data-w="${w}">Wave ${w}: ${l.title}</button>`).join('');
   modal(`<div class="eyebrow">Field guide</div><h2>Lessons so far</h2>
-    <p>Each wave introduces a concept. Revisit any of them here.</p><div class="lessons">${items}</div>`, [{ label: 'Close', primary: true }]);
+    <p>Each wave introduces a concept. Revisit any of them here.</p>${fieldGuideButtonHtml()}<div class="lessons">${items}</div>`, [{ label: 'Close', primary: true }]);
   $('#modal .lessons').addEventListener('click', (e) => {
     const w = (e.target as HTMLElement).closest<HTMLElement>('[data-w]')?.dataset.w;
     if (w) modal(lessonHtml(Number(w), LESSONS[Number(w)]), [{ label: 'Back', onClick: showLessonIndex }, { label: 'Close', primary: true }]);
@@ -542,12 +546,19 @@ function frame(now: number) {
   if (uiAcc > 0.1) {
     uiAcc = 0;
     refreshHud(); refreshPalette(); refreshInspector(); refreshAdvisor(); refreshLog(); refreshQuickstart(); refreshCharts();
+    setPlacingHint(view.placing?.kind ?? null);
   }
   requestAnimationFrame(frame);
 }
 
 window.addEventListener('resize', () => renderer.resize());
 buildPalette();
+// component guide (guideview.ts): palette hover cards, "How it works" modal, lesson diagrams
+let guidePrevSpeed = 0;
+initGuide({
+  unlocked: (f) => world.unlocked(f),
+  onModal: (open) => { if (open) { guidePrevSpeed = speed; if (world.phase === 'run') setSpeed(0); } else if (world.phase === 'run' && guidePrevSpeed) setSpeed(guidePrevSpeed); },
+});
 wireWorld();
 if (import.meta.env.DEV) Object.assign(window, { game: () => world });
 renderer.resize();
