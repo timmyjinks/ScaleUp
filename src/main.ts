@@ -5,6 +5,7 @@ import { fieldGuideButtonHtml, guideButtonHtml, initGuide, lessonDiagramsHtml, m
 import { NODE_H, NODE_W, Renderer, drawIcon, type ViewState } from './render';
 import { World, fmt } from './sim';
 import { LESSONS, QUICKSTART, type Lesson } from './tutorial';
+import { installSaveAndSandbox } from './menu';
 import type { CacheStrategy, NodeKind, SimNode, TierSpec } from './types';
 
 const $ = <T extends HTMLElement = HTMLElement>(sel: string) => document.querySelector(sel) as T;
@@ -539,7 +540,7 @@ function frame(now: number) {
   if (world.phase === 'run' && speed > 0) {
     acc += dt * speed;
     let steps = 0;
-    while (acc >= TICK && steps < 20) { world.step(); acc -= TICK; steps++; }
+    while (acc >= TICK && steps < 20) { saveSandbox.beforeStep(); world.step(); acc -= TICK; steps++; }
   }
   renderer.draw(view, dt * speed, world.phase === 'run' && speed > 0);
   uiAcc += dt;
@@ -547,6 +548,7 @@ function frame(now: number) {
     uiAcc = 0;
     refreshHud(); refreshPalette(); refreshInspector(); refreshAdvisor(); refreshLog(); refreshQuickstart(); refreshCharts();
     setPlacingHint(view.placing?.kind ?? null);
+    saveSandbox.afterUi();
   }
   requestAnimationFrame(frame);
 }
@@ -563,4 +565,9 @@ wireWorld();
 if (import.meta.env.DEV) Object.assign(window, { game: () => world });
 renderer.resize();
 maybeShowLesson();
+// save/resume + sandbox (persist.ts, sandbox.ts, menu.ts)
+const saveSandbox = installSaveAndSandbox({
+  getWorld: () => world, getRenderer: () => renderer, reset, lessonsSeen, quick, modal, toast,
+  adopt: (w) => { world = w; renderer = new Renderer(canvas, world); renderer.resize(); view.selectedNode = view.selectedEdge = null; view.placing = view.linking = null; wireWorld(); inspectorHtml = advisorHtml = ''; },
+});
 requestAnimationFrame(frame);

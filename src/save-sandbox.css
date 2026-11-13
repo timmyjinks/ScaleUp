@@ -1,0 +1,42 @@
+/* Save menu + sandbox panel. Uses the tokens from style.css. */
+.sb-badge.hidden, #sandbox.hidden, #menu-pop.hidden { display: none !important; }
+
+/* ---------------- HUD badge + menu */
+.sb-badge {
+  font: 700 10px Inter, system-ui, sans-serif; letter-spacing: 0.1em; color: #0b0e16; background: var(--warn);
+  padding: 3px 8px; border-radius: 6px; margin: 0 12px 0 -4px; cursor: default;
+}
+#menu-pop {
+  position: fixed; z-index: 40; min-width: 200px; padding: 6px;
+  background: var(--panel-solid); border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+}
+#menu-pop .mp-head { font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); font-weight: 600; padding: 4px 8px 6px; }
+#menu-pop button { display: block; width: 100%; text-align: left; background: transparent; border: 0; border-radius: 7px; padding: 7px 10px; font-size: 12.5px; }
+#menu-pop button:hover { background: #20263a; }
+#menu-pop hr { border: 0; border-top: 1px solid var(--line); margin: 4px 2px; }
+
+/* ---------------- sandbox panel */
+#sandbox {
+  position: fixed; top: 80px; left: 224px; width: 290px; z-index: 9; max-height: calc(100vh - 230px); overflow: auto;
+  background: var(--panel); border: 1px solid var(--warn); border-radius: 12px; padding: 10px 12px; backdrop-filter: blur(8px);
+}
+#sandbox header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+#sandbox header b { font-size: 12px; color: var(--warn); text-transform: uppercase; letter-spacing: 0.08em; }
+#sandbox .live { font: 500 11px 'JetBrains Mono', monospace; color: var(--muted); margin-top: 4px; }
+#sandbox .sb-toggle { background: transparent; border: 1px solid var(--line); border-radius: 6px; width: 24px; height: 22px; padding: 0; color: var(--muted); }
+#sandbox.collapsed .sb-body { display: none; }
+#sandbox .sb-row { border-top: 1px solid var(--line); margin-top: 10px; padding-top: 8px; }
+#sandbox label { display: flex; justify-content: space-between; align-items: baseline; font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin-bottom: 4px; }
+#sandbox output { font: 600 12px 'JetBrains Mono', monospace; color: var(--text); text-transform: none; letter-spacing: 0; }
+#sandbox input[type='range'] { width: 100%; accent-color: var(--accent); margin: 2px 0; }
+#sandbox .sb-scale { position: relative; height: 12px; font: 500 9px 'JetBrains Mono', monospace; color: var(--muted); margin: 0 6px; }
+#sandbox .sb-scale span { position: absolute; transform: translateX(-50%); }
+#sandbox .sb-mix { display: grid; grid-template-columns: 46px 1fr 40px; align-items: center; gap: 8px; font-size: 11.5px; }
+#sandbox .sb-mix output { text-align: right; }
+#sandbox .sb-check { justify-content: flex-start; gap: 8px; text-transform: none; letter-spacing: 0; font-size: 12px; color: var(--text); margin: 6px 0 0; cursor: pointer; }
+#sandbox .sb-check input { accent-color: var(--accent); margin: 0; }
+#sandbox .sb-spike { display: grid; grid-template-columns: 52px 52px 1fr; gap: 6px; margin-bottom: 6px; }
+#sandbox select { background: #232a3d; color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 6px 4px; font: inherit; font-size: 12px; }
+#sandbox .sb-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+#sandbox .btn { font-size: 12px; padding: 6px 8px; }
+#sandbox .sb-foot { display: flex; justify-content: flex-end; }
