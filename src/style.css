@@ -78,10 +78,11 @@ code { font: 500 12px 'JetBrains Mono', monospace; background: #232838; padding:
 .tool.new .key { display: none; }
 
 /* ---------------- side panel */
-#side { position: fixed; top: 80px; right: 12px; width: 300px; max-height: calc(100vh - 92px - 150px); display: flex; flex-direction: column; gap: 10px; z-index: 10; }
+#side { position: fixed; top: 80px; right: 12px; width: 320px; max-height: calc(100vh - 92px - 150px); display: flex; flex-direction: column; gap: 10px; z-index: 10; }
 #side section { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 12px; }
 #side ul { list-style: none; margin: 0; padding: 0; }
 #inspector:empty { display: none; }
+#inspector { overflow: auto; max-height: 62vh; flex: none; }
 #inspector .head { display: flex; gap: 10px; align-items: center; margin-bottom: 8px; }
 #inspector .head .ico { width: 34px; height: 34px; border-radius: 8px; display: grid; place-items: center; }
 #inspector .head b { font-size: 14px; }
@@ -98,6 +99,14 @@ code { font: 500 12px 'JetBrains Mono', monospace; background: #232838; padding:
 #inspector .tiers td { padding: 1px 6px 1px 0; font-family: 'JetBrains Mono', monospace; }
 #inspector .tiers tr.cur td { color: var(--text); font-weight: 600; }
 #inspector .connects { font-size: 11px; color: var(--muted); margin-bottom: 10px; }
+#inspector .connects b, #inspector .why b { color: var(--text); font-weight: 600; }
+#inspector .why { font-size: 11.5px; background: #1c2130; border-radius: 8px; padding: 6px 8px; }
+#inspector .settings { border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); padding: 8px 0 2px; margin: 8px 0; }
+#inspector .settings > label { display: block; font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 5px; }
+#inspector .settings .seg { flex-wrap: wrap; }
+#inspector .settings .seg button { flex: 1; padding: 5px 6px; font-size: 11px; white-space: nowrap; }
+#inspector .tiers tr[data-act] { cursor: pointer; }
+#inspector .tiers tr[data-act]:hover td { color: var(--accent); }
 .btn { background: #232a3d; border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; font-weight: 500; }
 .btn:hover:not(:disabled) { background: #2b3350; }
 .btn:disabled { opacity: 0.4; cursor: not-allowed; }

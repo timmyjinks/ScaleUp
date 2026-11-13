@@ -1,10 +1,10 @@
 import './style.css';
-import { PALETTE_ORDER, SLA, SPECS, TICK, UNLOCKS, USERS_PER_RPS, waveRps } from './config';
+import { CACHE_STRATEGIES, GEO, PALETTE_ORDER, RESIZE_S, SLA, SPECS, TICK, UNLOCKS, USERS_PER_RPS, waveRps } from './config';
 import { advise } from './advisor';
 import { NODE_H, NODE_W, Renderer, drawIcon, type ViewState } from './render';
 import { World, fmt } from './sim';
 import { LESSONS, QUICKSTART, type Lesson } from './tutorial';
-import type { NodeKind, SimNode } from './types';
+import type { CacheStrategy, NodeKind, SimNode, TierSpec } from './types';
 
 const $ = <T extends HTMLElement = HTMLElement>(sel: string) => document.querySelector(sel) as T;
 
@@ -77,7 +77,8 @@ function refreshPalette() {
     b.classList.toggle('on', view.placing?.kind === kind);
     b.classList.toggle('new', unlocked && UNLOCKS[kind] === world.waveNum && world.waveNum > 1);
     const small = b.querySelector('small')!;
-    const txt = unlocked ? `${money(cost)} · ${fmt(SPECS[kind].tiers[0].cap)} rps` : `🔒 wave ${UNLOCKS[kind]}`;
+    const t0 = SPECS[kind].tiers[0];
+    const txt = unlocked ? `${t0.perM ? (cost ? `${money(cost)}/mo + usage` : 'pay per request') : `${money(cost)}/mo · ${fmt(t0.cap)} ${SPECS[kind].unit.replace('API ', '')}`}` : `🔒 wave ${UNLOCKS[kind]}`;
     if (small.textContent !== txt) small.textContent = txt;
   }
 }
@@ -247,10 +248,10 @@ function refreshHud() {
     running ? `${fmt(m.demand)} req/s` : `peak ${fmt(w.peakRps)} req/s incoming`);
   setStat('s-p99', running ? ms(m.p99) : '—', running ? `p50 ${ms(m.p50)}` : `SLA < ${SLA.p99}ms`,
     !running ? '' : m.p99 > SLA.p99 ? 'bad' : m.p99 > SLA.p99 * 0.6 ? 'warn' : 'good');
-  setStat('s-err', running ? (m.errorRate * 100).toFixed(m.errorRate < 0.1 ? 2 : 1) + '%' : '—', running ? `${fmt(m.errors)} failing/s` : `SLA < ${SLA.errorRate * 100}%`,
+  setStat('s-err', running ? (m.errorRate * 100).toFixed(m.errorRate < 0.1 ? 2 : 1) + '%' : '—', running ? `${fmt(m.errors)} failing/s${m.staleRate > 0.005 ? ` · ${(m.staleRate * 100).toFixed(1)}% stale reads` : ''}` : `SLA < ${SLA.errorRate * 100}%`,
     !running ? '' : m.errorRate > SLA.errorRate ? 'bad' : m.errorRate > SLA.errorRate / 3 ? 'warn' : 'good');
   const net = m.revenue - m.upkeep;
-  setStat('s-money', money(Math.floor(world.money)), running ? `${net >= 0 ? '+' : ''}${money(net)}/s` : `upkeep ${money(upkeepNow())}/s`, world.money < 0 ? 'bad' : '');
+  setStat('s-money', money(Math.floor(world.money)), running ? `${net >= 0 ? '+' : ''}${money(net)}/mo net` : `bill ${money(world.burn())}/mo`, world.money < 0 ? 'bad' : '');
   const rep = $('#s-rep .meter i');
   rep.style.width = `${world.reputation}%`;
   rep.style.background = world.reputation > 60 ? 'var(--good)' : world.reputation > 30 ? 'var(--warn)' : 'var(--bad)';
@@ -260,9 +261,27 @@ function refreshHud() {
   btn.classList.toggle('pulse', world.phase === 'build' && quick.has('db-link'));
 }
 
-function upkeepNow() { return world.nodes.reduce((a, n) => a + SPECS[n.kind].tiers[n.tier].upkeep, 0); }
 
 // ------------------------------------------------------------------ inspector
+
+const specLine = (t: TierSpec) => [t.vcpu ? `${t.vcpu} vCPU${t.burst ? ' (burst)' : ''}` : '', t.ram ? `${t.ram} GB` : '', t.tag ?? ''].filter(Boolean).join(' · ');
+
+function settingsHtml(n: SimNode) {
+  const opt = (act: string, v: string, label: string, on: boolean) => `<button class="${on ? 'on' : ''}" data-act="${act}" data-v="${v}">${label}</button>`;
+  if (n.kind === 'cache') {
+    const cur = CACHE_STRATEGIES[n.strategy];
+    return `<div class="settings"><label>Caching strategy</label>
+      <div class="seg">${(Object.keys(CACHE_STRATEGIES) as CacheStrategy[]).map((k) => opt('strategy', k, CACHE_STRATEGIES[k].label, n.strategy === k)).join('')}</div>
+      <p>${cur.how}</p><div class="connects"><b>Wire it:</b> ${cur.wiring}</div></div>`;
+  }
+  if (n.kind === 'cdn') return `<div class="settings"><label>What the edge caches</label>
+      <div class="seg">${opt('cdnapi', '0', 'Static assets', !n.cdnApi)}${opt('cdnapi', '1', 'Static + public GETs', n.cdnApi)}</div>
+      <p>${n.cdnApi ? 'Also caches public (non-personalized) GET responses for 10s: ~40% of reads become edge hits, at the cost of serving data up to 10s stale. With Users → LB also wired, reads go via the CDN too.' : 'Only static files (images, JS, CSS) are cached. Versioned URLs make them safe to cache for a long time.'}</p></div>`;
+  if (n.kind === 'database' || n.kind === 'replica') return `<div class="settings"><label>Connection pooler (RDS Proxy / PgBouncer)</label>
+      <div class="seg">${opt('pooler', '0', 'Off', !n.pooler)}${opt('pooler', '1', `On · ${money(11 * Math.max(2, SPECS[n.kind].tiers[n.tier].vcpu))}/mo`, n.pooler)}</div>
+      <p>Each app process keeps its own pool of DB connections, and every Postgres connection is a process using ~8 MB. A pooler multiplexes thousands of client connections onto a few hundred real ones.</p></div>`;
+  return '';
+}
 
 let inspectorHtml = '';
 function refreshInspector() {
@@ -276,28 +295,30 @@ function refreshInspector() {
     const tier = spec.tiers[n.tier];
     const up = world.upgradeCost(n);
     const isUsers = n.kind === 'users';
-    const extra =
-      n.kind === 'cache' || n.kind === 'cdn' ? `<div><label>Hit rate</label><span>${Math.round(st.hitRate * 100)}%</span></div>` :
-      n.kind === 'queue' ? `<div><label>Backlog</label><span>${fmt(n.backlog)}</span></div>` :
-      `<div><label>Queue</label><span>${fmt(n.backlog)}</span></div>`;
+    const running = world.phase === 'run';
+    const restart = running && RESIZE_S[n.kind] > 0 ? ` (restarts ~${RESIZE_S[n.kind]}s)` : '';
+    const cell = (k: string, v: string, bad?: boolean) => `<div><label>${k}</label><span style="color:${bad ? 'var(--bad)' : 'inherit'}">${v}</span></div>`;
+    const cost = world.phase === 'run' ? st.cost : tier.cost + world.poolerCost(n);
     html = `
       <div class="head"><span class="ico" style="background:${spec.color}" data-icon="${n.kind}"></span>
-        <div><b>${spec.label} <span style="color:var(--muted);font-weight:400">#${n.id}</span></b><small>${isUsers ? 'traffic source' : tier.name}</small></div></div>
+        <div><b>${spec.label} <span style="color:var(--muted);font-weight:400">#${n.id}</span></b><small>${isUsers ? `${GEO.map((g) => `${Math.round(g.share * 100)}% at ${g.rtt}ms`).join(' · ')}` : `${tier.name} · ${specLine(tier) || 'managed'} · ${money(cost)}/mo`}</small></div></div>
       ${st.note ? `<div class="note">⚠ ${st.note}</div>` : ''}
       <div class="grid">
-        <div><label>In</label><span>${fmt(st.inRps)}/s</span></div>
-        ${isUsers ? '' : `<div><label>Capacity</label><span>${fmt(tier.cap)}/s</span></div>
-        <div><label>Utilization</label><span style="color:${st.util > 1 ? 'var(--bad)' : st.util > 0.8 ? 'var(--warn)' : 'inherit'}">${Math.round(st.util * 100)}%</span></div>
-        <div><label>Latency</label><span>${ms(st.latency)}</span></div>
-        <div><label>Dropped</label><span style="color:${st.dropRps > 0.5 ? 'var(--bad)' : 'inherit'}">${fmt(st.dropRps)}/s</span></div>
-        ${extra}`}
+        ${cell('In', `${fmt(st.inRps)}/s`)}
+        ${isUsers ? cell('Online', fmt(world.metrics.demand * USERS_PER_RPS)) : `${cell('Capacity', `${fmt(tier.cap)} ${spec.unit}`)}
+        ${cell('Load', `${Math.round(st.util * 100)}%`, st.util > 1)}
+        ${cell('Latency', ms(st.latency))}
+        ${cell('Dropped', `${fmt(st.dropRps)}/s`, st.dropRps > 0.5)}
+        ${st.rows.map(([k, v, bad]) => cell(k, v, bad)).join('')}`}
       </div>
+      ${st.ramWhy ? `<p class="why"><b>RAM:</b> ${st.ramWhy}</p>` : ''}
+      ${settingsHtml(n)}
       <p>${spec.blurb}</p>
-      ${spec.canConnectTo.length ? `<div class="connects">Connects to: ${spec.canConnectTo.map((k) => SPECS[k].label).join(', ')}</div>` : ''}
+      <div class="connects"><b>How to wire:</b> ${spec.wiring}</div>
       ${isUsers ? '' : `
-      <table class="tiers">${spec.tiers.map((t, i) => `<tr class="${i === n.tier ? 'cur' : ''}"><td>${i === n.tier ? '▸' : ' '}</td><td>${t.name}</td><td>${fmt(t.cap)} rps</td><td>${money(t.cost)}</td></tr>`).join('')}</table>
+      <table class="tiers">${spec.tiers.map((t, i) => `<tr class="${i === n.tier ? 'cur' : ''}" ${i === n.tier ? '' : `data-act="tier" data-v="${i}" title="Resize to ${t.name}${restart}"`}><td>${i === n.tier ? '▸' : ' '}</td><td>${t.name}</td><td>${t.vcpu ? `${t.vcpu}c/${t.ram}G` : ''}</td><td>${fmt(t.cap)}</td><td>${money(t.cost)}${t.perM ? '+' : ''}</td></tr>`).join('')}</table>
       <div class="row">
-        <button class="btn" data-act="upgrade" ${up === null || !world.unlocked('upgrade') ? 'disabled' : ''}>${up === null ? 'Max size' : !world.unlocked('upgrade') ? `Upgrade 🔒 w${UNLOCKS.upgrade}` : `Upgrade · ${money(up)}`}</button>
+        <button class="btn" data-act="upgrade" ${up === null || !world.unlocked('upgrade') ? 'disabled' : ''}>${up === null ? 'Max size' : !world.unlocked('upgrade') ? `Upgrade 🔒 w${UNLOCKS.upgrade}` : `Upgrade · ${money(up)}${restart}`}</button>
         <button class="btn danger" data-act="sell">Sell · ${money(world.sellValue(n))}</button>
       </div>`}`;
   } else if (e) {
@@ -309,6 +330,8 @@ function refreshInspector() {
         <div><label>Writes</label><span class="c-w">${fmt(e.rps.w)}/s</span></div>
         <div><label>Bots</label><span class="c-b">${fmt(e.rps.b)}/s</span></div>
       </div>
+      ${a?.kind === 'database' && b?.kind === 'replica' ? '<p>Async replication: every committed write is shipped to the replica and replayed.</p>' : ''}
+      ${b?.kind === 'cache' || a?.kind === 'cache' ? '<p>Cache traffic includes GETs, SETs after a miss, and DELETEs (invalidations) after writes.</p>' : ''}
       <div class="row"><button class="btn danger" data-act="unlink">Remove connection</button></div>`;
   }
   if (html !== inspectorHtml) {
@@ -318,9 +341,14 @@ function refreshInspector() {
   }
 }
 $('#inspector').addEventListener('click', (ev) => {
-  const act = (ev.target as HTMLElement).closest<HTMLElement>('[data-act]')?.dataset.act;
+  const t = (ev.target as HTMLElement).closest<HTMLElement>('[data-act]');
+  const act = t?.dataset.act, v = t?.dataset.v ?? '';
   const n = view.selectedNode != null ? world.node(view.selectedNode) : undefined;
   if (act === 'upgrade' && n) doUpgrade(n);
+  if (act === 'tier' && n) { const err = world.resize(n, Number(v)); if (err) toast(err); }
+  if (act === 'strategy' && n) world.setStrategy(n, v as CacheStrategy);
+  if (act === 'cdnapi' && n) world.setCdnApi(n, v === '1');
+  if (act === 'pooler' && n) world.setPooler(n, v === '1');
   if (act === 'sell' && n) { world.removeNode(n.id); view.selectedNode = null; }
   if (act === 'unlink' && view.selectedEdge != null) { world.removeEdge(view.selectedEdge); view.selectedEdge = null; }
   inspectorHtml = '';

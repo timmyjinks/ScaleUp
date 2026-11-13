@@ -242,7 +242,7 @@ export class Renderer {
       ctx.shadowColor = '#f43f5e';
       ctx.shadowBlur = 12 + 8 * Math.sin(this.time * 8);
     }
-    const sub = n.kind === 'users' ? `${fmt(this.world.metrics.demand * USERS_PER_RPS)} online` : `${spec.tiers[n.tier].name} · ${tierPips(n.tier, spec.tiers.length)}`;
+    const sub = n.kind === 'users' ? `${fmt(this.world.metrics.demand * USERS_PER_RPS)} online` : n.kind === 'cache' && n.strategy !== 'aside' ? `${spec.tiers[n.tier].name} · ${n.strategy}` : spec.tiers.length > 4 || spec.tiers[n.tier].name.length > 14 ? spec.tiers[n.tier].name : `${spec.tiers[n.tier].name} · ${tierPips(n.tier, spec.tiers.length)}`;
     const title = n.kind === 'users' ? 'Users' : `${spec.label}`;
     this.drawCard(ctx, n.kind, n.x, n.y, title, sub, col, sel ? col('--accent') : view.hoverNode === n.id ? col('--text') : col('--node-border'));
     ctx.shadowBlur = 0;
