@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Scale Up: System Design Game</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet" />
+  </head>
+  <body>
+    <canvas id="board"></canvas>
+
+    <header id="hud">
+      <div class="brand">Scale<span>Up</span></div>
+      <div class="stat" id="s-wave"><label>Wave</label><b>1</b><small></small></div>
+      <div class="stat" id="s-users"><label>Users online</label><b>0</b><small></small></div>
+      <div class="stat" id="s-p99"><label>p99 latency</label><b>0</b><small></small></div>
+      <div class="stat" id="s-err"><label>Error rate</label><b>0</b><small></small></div>
+      <div class="stat" id="s-money"><label>Budget</label><b>$0</b><small></small></div>
+      <div class="stat rep" id="s-rep"><label>Reputation</label><div class="meter"><i></i></div></div>
+      <div class="controls">
+        <button id="btn-start" class="primary">Start wave</button>
+        <div class="seg" id="speed">
+          <button data-speed="0" title="Pause (Space)">❚❚</button>
+          <button data-speed="1" class="on">1x</button>
+          <button data-speed="2">2x</button>
+          <button data-speed="4">4x</button>
+        </div>
+        <button id="btn-help" class="ghost" title="Lessons">?</button>
+      </div>
+    </header>
+
+    <aside id="palette"></aside>
+
+    <aside id="side">
+      <section id="inspector"></section>
+      <section id="advisor"><h3>Advisor</h3><ul></ul></section>
+      <section id="log"><h3>Incident log</h3><ul></ul></section>
+    </aside>
+
+    <section id="charts">
+      <div class="chart"><label>Traffic <span class="k k-d">demand</span> <span class="k k-s">served</span></label><canvas id="c-traffic"></canvas></div>
+      <div class="chart"><label>p99 latency <span class="k k-sla">SLA 800ms</span></label><canvas id="c-lat"></canvas></div>
+      <div class="chart"><label>Errors <span class="k k-sla">SLA 1%</span></label><canvas id="c-err"></canvas></div>
+      <div class="legend">
+        <span><i class="c-s">●</i>static</span><span><i class="c-r">●</i>read</span><span><i class="c-w">●</i>write</span><span><i class="c-b">●</i>bot</span><span><i class="c-x">■</i>dropped</span>
+      </div>
+    </section>
+
+    <div id="quickstart"></div>
+    <div id="toast"></div>
+    <div id="modal" class="hidden"><div class="card"></div></div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
