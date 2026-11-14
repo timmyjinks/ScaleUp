@@ -178,3 +178,21 @@ code { font: 500 12px 'JetBrains Mono', monospace; background: #232838; padding:
   .stat { min-width: 0; padding: 0 8px; }
   #charts { display: none; }
 }
+
+/* multi-select + groups */
+#inspector .chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 8px; }
+#inspector .chip { display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; padding: 3px 8px; border: 1px solid var(--line); border-radius: 999px; }
+#inspector .chip i { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+#inspector .picks { list-style: none; margin: 0 0 10px; padding: 0; max-height: 160px; overflow: auto; }
+#inspector .picks li { display: flex; align-items: center; gap: 8px; padding: 4px 6px; border-radius: 6px; cursor: pointer; font-size: 12px; }
+#inspector .picks li:hover { background: var(--line); }
+#inspector .picks li i { width: 8px; height: 8px; border-radius: 2px; flex: none; }
+#inspector .picks li span { color: var(--muted); margin-left: auto; }
+#inspector .stepper { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+#inspector .stepper b { min-width: 24px; text-align: center; font-size: 15px; }
+#inspector .stepper input.num {
+  width: 56px; padding: 3px 4px; text-align: center; font: inherit; font-size: 15px; font-weight: 700;
+  color: var(--text); background: var(--node); border: 1px solid var(--node-border); border-radius: 6px;
+}
+#inspector .stepper input.num:focus { outline: none; border-color: var(--accent); }
+#inspector .row + .row { margin-top: 6px; }

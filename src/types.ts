@@ -34,6 +34,12 @@ export interface Flow {
   src?: number;
 }
 
+/**
+ * Target-tracking scaling policy for a group: keep load per instance near `target` by adding/removing instances.
+ * `min` instances are always running (and are what you pay up front); the rest are billed only while they run.
+ */
+export interface Autoscale { min: number; max: number; target: number }
+
 /** How the app uses a cache. */
 export type CacheStrategy = 'aside' | 'readthrough' | 'writethrough' | 'writeback';
 
@@ -47,6 +53,11 @@ export interface SimNode {
   strategy: CacheStrategy; // caches
   cdnApi: boolean; // CDN also caches public GET responses
   pooler: boolean; // database/replica: connection pooler (RDS Proxy / PgBouncer) in front
+  count: number; // identical instances in this node (an autoscaling group); only GROUPABLE kinds go above 1
+  /** scaling policy; null = fixed size (count only changes when you change it) */
+  auto: Autoscale | null;
+  /** instances of a group that are out of service: crashed (restarting) or still booting after a scale-out */
+  instDown: { t: number; boot?: boolean }[];
   // --- runtime state ---
   backlog: number; // queued work units
   downFor: number; // seconds remaining while crashed / restarting
@@ -57,6 +68,7 @@ export interface SimNode {
   resp: number; // ms from arrival here to response (incl. downstream calls), smoothed
   inflight: number; // concurrent requests held (Little's law), smoothed
   conns: number; // database: open client connections
+  room: number; // replica: reads/s it can take on top of replaying writes (smoothed; -1 = not measured yet)
   stats: NodeStats;
 }
 
@@ -105,6 +117,12 @@ export interface TierSpec {
   perM?: number;
   /** burstable (t-family) instance */
   burst?: boolean;
+  /** overrides the kind's base latency (ms) for this tier */
+  lat?: number;
+  /** burstable: CPU share per vCPU covered by the base price; above it, unlimited mode bills surplus credits */
+  baseline?: number;
+  /** burstable: $ per vCPU-hour of CPU above the baseline */
+  surplus?: number;
   /** short qualifier shown in the tier table */
   tag?: string;
 }

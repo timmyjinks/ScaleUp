@@ -12,7 +12,7 @@
  * so it gets current defaults (incl. fields old saves don't know about), then the
  * saved fields are copied over it.
  */
-import { SPECS, makeWave } from './config';
+import { GROUPABLE, MAX_GROUP, SPECS, makeWave } from './config';
 import type { Renderer } from './render';
 import { World, zero } from './sim';
 import type { Edge, NodeKind, SimNode } from './types';
@@ -125,6 +125,15 @@ export function restoreWorld(s: Snapshot): World {
     // resume at the start of a build phase: mirror what World.endWave() resets
     if (n.kind !== 'queue') n.backlog = 0;
     n.downFor = 0;
+    n.count = Math.max(1, Math.round(Number(n.count) || 1));
+    n.instDown = [];
+    // a save made mid-wave holds the live size; resume an autoscaling group at its minimum, like endWave does
+    const a = n.auto as Partial<NonNullable<SimNode['auto']>> | null | undefined;
+    if (a && typeof a === 'object' && GROUPABLE.includes(n.kind)) {
+      const min = Math.min(n.count, Math.max(1, Math.round(Number(a.min)) || n.count));
+      n.auto = { min, max: Math.min(MAX_GROUP, Math.max(min, Math.round(Number(a.max)) || min)), target: Math.min(0.95, Math.max(0.2, Number(a.target) || 0.6)) };
+      n.count = min;
+    } else n.auto = null; // older saves have no policy
   }
   if (!w.nodes.some((n) => n.kind === 'users')) w.addNode('users', 80, 300, true);
   const ids = new Set(w.nodes.map((n) => n.id));
@@ -132,6 +141,7 @@ export function restoreWorld(s: Snapshot): World {
     .filter((e) => typeof e.id === 'number' && ids.has(e.from as number) && ids.has(e.to as number))
     .map((e) => ({ ...clone(e), rps: zero() }) as unknown as Edge);
   (w as unknown as { nextId: number }).nextId = Math.max(Number(s.nextId) || 0, readNextId(w));
+  w.linkReaders(); // older saves: servers on a primary read from its replicas too
   w.wave = makeWave(w.waveNum);
   w.phase = 'build';
   w.time = 0;

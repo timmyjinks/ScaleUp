@@ -14,14 +14,19 @@ interface Particle { edge: number; t: number; speed: number; color: string }
 interface Spark { x: number; y: number; vx: number; vy: number; life: number }
 
 export interface ViewState {
+  /** primary selection (the inspector shows it); always part of `selected` */
   selectedNode: number | null;
+  /** every selected node (shift-click / box select) */
+  selected: number[];
+  /** box selection in progress, world coords */
+  box: { x0: number; y0: number; x1: number; y1: number } | null;
   selectedEdge: number | null;
   hoverNode: number | null;
   hoverEdge: number | null;
   /** in-progress connection drag */
   linking: { from: number; x: number; y: number; valid: boolean | null } | null;
   /** ghost of a node being placed */
-  placing: { kind: NodeKind; x: number; y: number; ok: boolean } | null;
+  placing: { kind: NodeKind; x: number; y: number; ok: boolean; anchor?: number | null; wire?: 'out' | 'in' | 'copy' | null } | null;
 }
 
 export class Renderer {
@@ -158,9 +163,32 @@ export class Renderer {
       ctx.fillRect(s.x - 2, s.y - 2, 4, 4);
     }
     ctx.globalAlpha = 1;
-    // placement ghost
+    // box selection
+    if (view.box) {
+      const b = view.box;
+      ctx.fillStyle = 'rgba(124,156,255,0.08)';
+      ctx.strokeStyle = col('--accent');
+      ctx.lineWidth = 1 / this.cam.z;
+      ctx.setLineDash([5 / this.cam.z, 4 / this.cam.z]);
+      ctx.fillRect(Math.min(b.x0, b.x1), Math.min(b.y0, b.y1), Math.abs(b.x1 - b.x0), Math.abs(b.y1 - b.y0));
+      ctx.strokeRect(Math.min(b.x0, b.x1), Math.min(b.y0, b.y1), Math.abs(b.x1 - b.x0), Math.abs(b.y1 - b.y0));
+      ctx.setLineDash([]);
+    }
+    // placement ghost (+ the link it will get automatically)
     if (view.placing) {
       const { kind, x, y, ok } = view.placing;
+      const anchor = view.placing.anchor != null ? this.world.node(view.placing.anchor) : undefined;
+      if (anchor && view.placing.wire && x > -9000) {
+        const g = { x: x - NODE_W / 2, y: y - NODE_H / 2 };
+        const c = view.placing.wire === 'in' ? link({ x: g.x + NODE_W, y: g.y + NODE_H / 2 }, inPort(anchor)) : link(outPort(anchor), { x: g.x, y: g.y + NODE_H / 2 });
+        ctx.strokeStyle = col('--accent');
+        ctx.setLineDash([6, 6]);
+        ctx.lineWidth = 2;
+        ctx.globalAlpha = 0.7;
+        strokeCurve(ctx, c);
+        ctx.setLineDash([]);
+        ctx.globalAlpha = 1;
+      }
       ctx.globalAlpha = 0.55;
       this.drawCard(ctx, kind, x - NODE_W / 2, y - NODE_H / 2, SPECS[kind].label, SPECS[kind].tiers[0].name, col, ok ? SPECS[kind].color : '#f43f5e');
       ctx.globalAlpha = 1;
@@ -236,16 +264,30 @@ export class Renderer {
   private drawNode(ctx: CanvasRenderingContext2D, n: SimNode, view: ViewState, col: (v: string) => string) {
     const spec = SPECS[n.kind];
     const st = n.stats;
-    const down = n.downFor > 0;
+    const down = n.downFor > 0 || (n.instDown.length > 0 && this.world.active(n) === 0);
     const hot = st.util > 1 || st.dropRps > 0.5;
-    const sel = view.selectedNode === n.id;
+    const sel = view.selectedNode === n.id || view.selected.includes(n.id);
+    const group = n.count > 1;
+    const up = this.world.active(n);
+
+    // a group draws as a stack of cards
+    if (group) {
+      for (const k of [2, 1]) {
+        ctx.fillStyle = col('--node');
+        ctx.strokeStyle = col('--node-border');
+        ctx.lineWidth = 1.5;
+        roundRect(ctx, n.x + 5 * k, n.y - 5 * k, NODE_W, NODE_H, 10);
+        ctx.fill();
+        ctx.stroke();
+      }
+    }
 
     if (hot && !down) {
       ctx.shadowColor = '#f43f5e';
       ctx.shadowBlur = 12 + 8 * Math.sin(this.time * 8);
     }
-    const sub = n.kind === 'users' ? `${fmt(this.world.metrics.demand * USERS_PER_RPS)} online` : n.kind === 'cache' && n.strategy !== 'aside' ? `${spec.tiers[n.tier].name} · ${n.strategy}` : spec.tiers.length > 4 || spec.tiers[n.tier].name.length > 14 ? spec.tiers[n.tier].name : `${spec.tiers[n.tier].name} · ${tierPips(n.tier, spec.tiers.length)}`;
-    const title = n.kind === 'users' ? 'Users' : `${spec.label}`;
+    const sub = group && up < n.count && !down ? `${spec.tiers[n.tier].name} · ${up}/${n.count} up` : n.kind === 'users' ? `${fmt(this.world.metrics.demand * USERS_PER_RPS)} online` : n.kind === 'cache' && n.strategy !== 'aside' ? `${spec.tiers[n.tier].name} · ${n.strategy}` : spec.tiers.length > 4 || spec.tiers[n.tier].name.length > 14 ? spec.tiers[n.tier].name : `${spec.tiers[n.tier].name} · ${tierPips(n.tier, spec.tiers.length)}`;
+    const title = n.kind === 'users' ? 'Users' : group || n.auto ? `${spec.label} ×${n.count}${n.auto ? ' ⟳' : ''}` : `${spec.label}`;
     this.drawCard(ctx, n.kind, n.x, n.y, title, sub, col, sel ? col('--accent') : view.hoverNode === n.id ? col('--text') : col('--node-border'));
     ctx.shadowBlur = 0;
 

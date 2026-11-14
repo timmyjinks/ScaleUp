@@ -3,13 +3,16 @@ import type { CacheStrategy, NodeKind, NodeSpec, TierSpec, WaveDef, WaveEvent } 
 export const TICK = 0.1; // sim seconds per tick
 export const TIMEOUT_MS = 3000; // requests slower than this count as errors
 export const USERS_PER_RPS = 10; // ~1 request every 10s per active user
-export const SLA = { errorRate: 0.01, p99: 800 };
+export const SLA = { errorRate: 0.01, p99: 800, stale: 0.05 }; // stale: share of reads missing the user's latest writes
 export const START_MONEY = 120;
 
 // ---- economy: one wave is one month of business, compressed into `duration` seconds
 export const SECONDS_PER_MONTH = 2_628_000;
-/** $ earned per month by 1 req/s of successfully served traffic (≈ $1.1 per million requests) */
-export const REVENUE_PER_RPS_MONTH = 3;
+/**
+ * $ earned per month by 1 req/s of successfully served traffic (≈ $10 per million requests).
+ * Ballpark for an ad- or subscription-funded web app, where the cloud bill is typically 5-15% of revenue.
+ */
+export const REVENUE_PER_RPS_MONTH = 26;
 
 // ---- physics (real-world ballparks)
 /** where users are: share of traffic, RTT to your datacenter, RTT to the nearest CDN edge (ms) */
@@ -31,6 +34,24 @@ export const FAILOVER_S = 15; // managed DB promotes a replica after this long
 export const OOM_RESTART_S = 10; // process restart + health checks
 export const REPLICA_APPLY_COST = 2; // work units for a replica to replay one write
 export const WRITEBACK_COALESCE = 0.6; // write-back merges repeated writes to the same key
+/** server CPU for a write it only validates and enqueues (the transaction and business logic run on a worker) */
+export const ENQUEUE_CPU = 0.3;
+/** share of writes that can go async: likes, posts, order intake. The rest (payments, unique checks, stock) need an answer now */
+export const ASYNC_WRITE_SHARE = 0.7;
+/** DB work units per queued write: workers batch them (multi-row INSERT, one commit per batch) vs 5 for a single live write */
+export const BATCH_WRITE_COST = 2;
+/** disk IOPS per batched write (group commit) vs 1.5 for a single live write */
+export const BATCH_WRITE_IOPS = 0.5;
+export const HOURS_PER_MONTH = 730;
+/** during a hot-key event, share of DB reads/writes aimed at the single hot key (and so at its one shard) */
+export const HOT_KEY_SHARE = 0.35;
+/** share of reads that touch data written moments ago (your own post, your order status): the only reads lag can make stale */
+export const FRESH_READ_SHARE = 0.2;
+/**
+ * seconds before a newly launched group instance takes traffic (boot from the image, start the app, pass health checks).
+ * Shorter than a resize, which also has to stop the instance and change its type.
+ */
+export const BOOT_S = 3;
 /** downtime when resizing an instance mid-wave (stop, change type, start, warm up) */
 export const RESIZE_S: Record<NodeKind, number> = {
   users: 0, server: 8, worker: 8, loadbalancer: 8, ratelimiter: 8, cache: 10, database: 15, replica: 15, queue: 0, cdn: 0,
@@ -39,7 +60,7 @@ export const RESIZE_S: Record<NodeKind, number> = {
 const t = (name: string, vcpu: number, ram: number, cost: number, cap: number, o: Partial<TierSpec> = {}): TierSpec => ({ name, vcpu, ram, cost, cap, ...o });
 
 const ec2 = (cap: (i: number) => number): TierSpec[] => [
-  t('t3.small', 2, 2, 15, cap(0), { net: 16, burst: true, tag: 'burstable' }),
+  t('t3.small', 2, 2, 15, cap(0), { net: 16, burst: true, baseline: 0.2, surplus: 0.05, tag: 'burstable: 20% CPU included, then $0.05/vCPU-h' }),
   t('c6i.large', 2, 4, 62, cap(1), { net: 98 }),
   t('c6i.xlarge', 4, 8, 124, cap(2), { net: 195 }),
   t('c6i.2xlarge', 8, 16, 248, cap(3), { net: 390 }),
@@ -48,8 +69,8 @@ const ec2 = (cap: (i: number) => number): TierSpec[] => [
 ];
 
 const rds: TierSpec[] = [
-  t('db.t4g.micro', 2, 1, 12, 1000, { iops: 1000, burst: true, tag: 'burstable' }),
-  t('db.t4g.medium', 2, 4, 47, 2500, { iops: 2000, burst: true, tag: 'burstable' }),
+  t('db.t4g.micro', 2, 1, 12, 1000, { iops: 1000, burst: true, baseline: 0.1, surplus: 0.075, tag: 'burstable: 10% CPU included, then $0.075/vCPU-h' }),
+  t('db.t4g.medium', 2, 4, 47, 2500, { iops: 2000, burst: true, baseline: 0.2, surplus: 0.075, tag: 'burstable: 20% CPU included, then $0.075/vCPU-h' }),
   t('db.r6g.large', 2, 16, 164, 4500, { iops: 3600 }),
   t('db.r6g.xlarge', 4, 32, 329, 9000, { iops: 6000 }),
   t('db.r6g.2xlarge', 8, 64, 657, 17000, { iops: 12000 }),
@@ -72,14 +93,14 @@ export const SPECS: Record<NodeKind, NodeSpec> = {
   server: {
     kind: 'server', label: 'App Server', short: 'APP', color: '#3b82f6', latency: 10, writeCost: 1, queueSeconds: 1, unit: 'API req/s',
     tiers: ec2((i) => [800, 2000, 4000, 7500, 14000, 25000][i]),
-    blurb: 'Runs your API (Node/Go/Java). A JSON request burns ~10ms of CPU; waiting on the DB costs no CPU but holds memory. A static file costs ~5x less CPU than an API call but uses NIC bandwidth (a t3.small sustains only ~16 MB/s). RAM = runtime + in-flight requests × ~1 MB, and in-flight = req/s × response time: a slow database makes requests pile up until the process is OOM-killed. Stateless, so run many behind a load balancer.',
+    blurb: 'Runs your API (Node/Go/Java). A typical JSON request burns ~1ms of CPU (about 1,000 req/s per vCPU) and takes ~10ms end to end; waiting on the DB costs no CPU but holds memory. A static file costs ~5x less CPU than an API call but uses NIC bandwidth (a t3.small sustains only ~16 MB/s). RAM = runtime + in-flight requests × ~1 MB, and in-flight = req/s × response time: a slow database makes requests pile up until the process is OOM-killed. Stateless, so run many behind a load balancer. A t3.small is cheap only while it idles: past 20% CPU it bills surplus CPU credits, and at full load it costs more than a c6i.large.',
     wiring: 'Users/LB → App Server → Database (reads + writes). Add → Cache for cache-aside (keep the Server → Database link: misses and writes use it), → Read Replica for read/write splitting, → Queue for async writes.',
     canConnectTo: ['database', 'replica', 'cache', 'queue'],
   },
   database: {
     kind: 'database', label: 'Database', short: 'DB', color: '#f59e0b', latency: 1.5, writeCost: 5, queueSeconds: 1.5, unit: 'reads/s',
     tiers: rds,
-    blurb: 'Postgres/MySQL primary on RDS: the source of truth. An indexed read is ~1-2ms; a write costs ~5x a read (WAL fsync, index updates, locks). Reads are fast only while the working set (hot rows + indexes, which grows with your users) fits in RAM; past that, queries go to disk and become IOPS-bound. Every client server holds a connection pool, and each Postgres connection is a process using ~8 MB, capped by max_connections.',
+    blurb: 'Postgres/MySQL primary on RDS: the source of truth. An indexed read is ~1-2ms; a write costs ~5x a read (WAL fsync, index updates, locks). Reads are fast only while the working set (hot rows + indexes, which grows with your users) fits in RAM; past that, queries go to disk and become IOPS-bound. Burstable db.t4g sizes include only 10-20% CPU; anything above bills surplus credits. Every client server holds a connection pool, and each Postgres connection is a process using ~8 MB, capped by max_connections.',
     wiring: 'App Server / Worker / Cache (read-through) → Database. Database → Read Replica sets up async replication. Only one primary until sharding (wave 11); then connect clients to several primaries and keys get hash-partitioned.',
     canConnectTo: ['replica'],
   },
@@ -109,7 +130,7 @@ export const SPECS: Record<NodeKind, NodeSpec> = {
   },
   cdn: {
     kind: 'cdn', label: 'CDN', short: 'CDN', color: '#06b6d4', latency: 1, writeCost: 1, queueSeconds: 0.1, unit: 'req/s',
-    tiers: [t('CloudFront', 0, 0, 0, Infinity, { perM: 0.75, tag: '$0.0075 per 10k requests' })],
+    tiers: [t('CloudFront', 0, 0, 0, Infinity, { perM: 1, tag: '$0.01 per 10k HTTPS requests' })],
     blurb: 'Hundreds of edge locations (PoPs) close to your users. Static assets are cached at the edge (~95% hit rate with versioned URLs): a far-away user gets them in ~20ms instead of ~180ms, and those bytes never touch your servers. Misses travel to your origin over the provider\'s backbone. Optionally it can cache public GET responses for a few seconds (TTL), which offloads reads but serves slightly stale data. Billed per request (bandwidth isn\'t billed in this game; in real life CDN $/GB is usually cheaper than origin egress).',
     wiring: 'Users → CDN → Load Balancer (everything via the CDN), or Users → CDN plus Users → LB (only static assets go via the CDN; API calls go direct). The CDN needs an origin link for misses.',
     canConnectTo: ['loadbalancer', 'server', 'ratelimiter'],
@@ -117,19 +138,19 @@ export const SPECS: Record<NodeKind, NodeSpec> = {
   replica: {
     kind: 'replica', label: 'Read Replica', short: 'RR', color: '#d97706', latency: 1.5, writeCost: 1, queueSeconds: 1.5, unit: 'reads/s',
     tiers: rds,
-    blurb: 'A read-only copy of the primary, kept up to date by async replication: it replays every write (~40% of what the write cost the primary), so writes do not scale with replicas. Replication lag is normally tens of ms, but grows when the replica is busy, and reads from a lagging replica can be stale (a user may not see their own write). If the primary dies, the managed DB promotes a replica after ~15s; writes it hadn\'t received yet are lost.',
-    wiring: 'Database → Replica (replication link), then App Server → Replica (and keep App Server → Database for writes): reads are split across the primary and replicas by size. A read-through cache can also read from replicas (Cache → Replica).',
+    blurb: 'A read-only copy of the primary, kept up to date by async replication: it replays every write (~40% of what the write cost the primary), so writes do not scale with replicas. Replication lag is normally tens of ms, but grows when the replica is busy, and reads from a lagging replica can be stale (a user may not see their own write). If the primary dies, the managed DB promotes a replica after ~15s; writes it hadn\'t received yet are lost. Each replica holds the full data set, so give it the same RAM as the primary: a small replica is disk-bound however many you add.',
+    wiring: 'Database → Replica (replication link). Every App Server or read-through Cache already connected to that Database starts reading from the replica automatically Reads go to the replicas and writes to the primary (read/write splitting); the primary only takes reads the replicas have no room for. Size replicas like the primary.',
     canConnectTo: [],
   },
   queue: {
     kind: 'queue', label: 'Message Queue', short: 'MQ', color: '#ec4899', latency: 15, writeCost: 1, queueSeconds: 600, unit: 'msgs/s',
     tiers: [
-      t('SQS standard', 0, 0, 0, 300000, { perM: 0.12, tag: '$0.40/M API calls, batched' }),
-      t('MSK 3× kafka.m5.large', 6, 24, 460, 60000, { tag: '~5ms, ~10k msgs/s per partition' }),
-      t('MSK 3× kafka.m5.2xlarge', 24, 96, 1840, 250000),
+      t('SQS standard', 0, 0, 0, 300000, { perM: 0.12, lat: 15, tag: '~15ms, $0.40/M API calls, batched' }),
+      t('MSK 3× kafka.m5.large', 6, 24, 460, 60000, { lat: 5, tag: '~5ms, ~10k msgs/s per partition' }),
+      t('MSK 3× kafka.m5.2xlarge', 24, 96, 1840, 250000, { lat: 5, tag: '~5ms' }),
     ],
-    blurb: 'Accepts writes and acknowledges them right away (async). Workers drain the backlog at a pace the database can take, which absorbs spikes and outages. SQS is effectively unlimited and bills per message (great until volume gets huge); Kafka is a fixed-price cluster with lower latency. Users get "accepted" immediately, but the data shows up in the DB later (eventual consistency).',
-    wiring: 'App Server → Queue → Workers → Database. Servers with a queue send all writes through it.',
+    blurb: 'Accepts writes and acknowledges them right away (async). Only ~70% of writes can go async (posts, likes, order intake); payments, unique checks and stock checks still need an answer now, so keep the Server → Database link. For a queued write the app server only validates and enqueues (~1/3 of the CPU); workers batch the inserts, so each costs the DB ~40% of a live write. Workers drain the backlog at a pace the database can take, which absorbs spikes and outages. While it is behind, reads miss the newest writes (stale). Off-peak, the rest of the month drains it; a queue with no workers lets messages expire (SQS keeps them 4 days). SQS is effectively unlimited and bills per message (great until volume gets huge); Kafka is a fixed-price cluster with lower latency. Users get "accepted" immediately, but the data shows up in the DB later (eventual consistency).',
+    wiring: 'App Server → Queue → Workers → Database, and keep App Server → Database for the writes that must be synchronous (~30%).',
     canConnectTo: ['worker'],
   },
   worker: {
@@ -175,11 +196,21 @@ export const CACHE_STRATEGIES: Record<CacheStrategy, { label: string; how: strin
   },
 };
 
+/** stateless kinds that can run as a group of identical instances (an autoscaling group behind the LB) */
+export const GROUPABLE: NodeKind[] = ['server', 'worker'];
+export const MAX_GROUP = 50;
+/** load-per-instance targets offered for target tracking: lower = more headroom for spikes, higher = cheaper */
+export const AUTOSCALE_TARGETS = [0.5, 0.6, 0.7];
+/** the policy sees its metric averaged over a period (CloudWatch), so it reacts to a change with a lag */
+export const AUTOSCALE_SMOOTH_S = 2;
+/** wait between scale-ins, so a dip doesn't drop capacity right before load comes back */
+export const AUTOSCALE_IN_COOLDOWN_S = 3;
+
 export const PALETTE_ORDER: NodeKind[] = ['server', 'database', 'loadbalancer', 'cache', 'cdn', 'replica', 'queue', 'worker', 'ratelimiter'];
 
 /** Wave at which each tool becomes available. */
 export const UNLOCKS: Record<string, number> = {
-  server: 1, database: 1, upgrade: 2, loadbalancer: 3, cache: 4, cdn: 6, replica: 7, queue: 8, worker: 8, ratelimiter: 9, sharding: 11,
+  server: 1, database: 1, upgrade: 2, loadbalancer: 3, cache: 4, cdn: 6, replica: 7, queue: 8, worker: 8, ratelimiter: 9, sharding: 11, autoscale: 5,
 };
 
 export function waveRps(n: number) {
@@ -202,7 +233,7 @@ export function makeWave(n: number): WaveDef {
     8: () => { title = 'Flash sale'; event = { type: 'flashsale', label: 'Flash sale: tons of writes (orders)' }; },
     9: () => { title = 'Under attack'; event = { type: 'bots', label: 'Bot attack: scrapers flooding you' }; },
     10: () => { title = 'Disk failure'; event = { type: 'dbcrash', at: 10, len: 30, label: 'Primary DB hardware failure: it\'s gone for 30s unless a replica can take over' }; },
-    11: () => { title = 'Celebrity joins'; event = { type: 'hotkey', label: 'Celebrity posts: writes way up, one hot shard' }; },
+    11: () => { title = 'Celebrity joins'; event = { type: 'hotkey', label: 'Celebrity posts: ~35% of database traffic hits ONE key, so its shard melts while the others idle' }; },
   };
   if (scripted[n]) scripted[n]();
   else if (n > 11) {
@@ -216,7 +247,8 @@ export function makeWave(n: number): WaveDef {
     ];
     pool[n % pool.length]();
   }
-  if (event?.type === 'flashsale' || event?.type === 'hotkey') mix = { s: 0.2, r: 0.45, w: 0.35, b: 0 };
+  if (event?.type === 'flashsale') mix = { s: 0.2, r: 0.45, w: 0.35, b: 0 }; // orders: a genuinely write-heavy month
+  if (event?.type === 'hotkey') mix = { s: 0.2, r: 0.62, w: 0.18, b: 0 }; // fans read the post and like/comment on it
   if (event?.type === 'bots') mix = { ...mix, b: 2 };
   return { index: n, peakRps: peak, duration: n <= 2 ? 30 : 40, mix, event, chaos: n >= 4 ? 0.02 + Math.min(0.04, n * 0.002) : 0, title };
 }

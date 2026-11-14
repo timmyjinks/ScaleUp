@@ -55,7 +55,7 @@ export const GUIDE: Record<GuideKey, GuideEntry> = {
     ],
     mistakes: [
       'Running a single server: it is a single point of failure, and they crash.',
-      'Upgrading one box forever. Bigger sizes cost ~3x for ~2.5x capacity.',
+      'Scaling one box up forever. Price per vCPU is flat, but the biggest sizes do a bit less work per dollar, there is a largest size, one box is a single point of failure, and resizing restarts it. A fleet also shrinks off-peak; one big box bills for peak all month.',
     ],
     examples: 'EC2 / GCE VMs, containers on Kubernetes or ECS, a Node / Go / Java service.',
     interview: 'Keep app servers stateless (sessions in Redis or a DB) so any server can handle any request and you can scale horizontally.',
@@ -167,7 +167,8 @@ export const GUIDE: Record<GuideKey, GuideEntry> = {
       { path: ['server', 'queue', 'worker', 'database'] },
     ],
     mistakes: [
-      'A queue with no workers. The backlog just grows forever.',
+      'A queue with no workers. The backlog just grows until messages expire.',
+      'Dropping the Server → Database link. Writes that need an answer now (payments, unique checks) and every read still go straight to the DB.',
       'Too many workers. They drain fast, but then they overload the database anyway.',
     ],
     examples: 'Amazon SQS, Kafka, RabbitMQ, Google Pub/Sub.',

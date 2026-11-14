@@ -1,9 +1,9 @@
 import {
-  API_KB, CACHE_HOT_MB_PER_USER, CACHE_STRATEGIES, CACHE_USABLE, DB_HOT_MB_PER_USER, DISK_MS, FAILOVER_S, GEO, OOM_RESTART_S, PAGES_PER_READ,
+  API_KB, ASYNC_WRITE_SHARE, AUTOSCALE_IN_COOLDOWN_S, AUTOSCALE_SMOOTH_S, BOOT_S, BATCH_WRITE_COST, BATCH_WRITE_IOPS, CACHE_HOT_MB_PER_USER, ENQUEUE_CPU, FRESH_READ_SHARE, HOT_KEY_SHARE, HOURS_PER_MONTH, GROUPABLE, MAX_GROUP, CACHE_STRATEGIES, CACHE_USABLE, DB_HOT_MB_PER_USER, DISK_MS, FAILOVER_S, GEO, OOM_RESTART_S, PAGES_PER_READ,
   PG_CONN_MB, REPLICA_APPLY_COST, REQ_MB, RESIZE_S, REVENUE_PER_RPS_MONTH, SECONDS_PER_MONTH, SLA, SPECS, START_MONEY, STATIC_KB, TICK,
   TIMEOUT_MS, UNLOCKS, USERS_PER_RPS, WRITEBACK_COALESCE, makeWave, maxConnections, waveShape, zipfHit,
 } from './config';
-import type { CacheStrategy, Edge, Flow, Metrics, Mix, NodeKind, NodeStats, Phase, SimNode, TierSpec, WaveDef } from './types';
+import type { Autoscale, CacheStrategy, Edge, Flow, Metrics, Mix, NodeKind, NodeStats, Phase, SimNode, TierSpec, WaveDef } from './types';
 
 const CDN_API_CACHEABLE = 0.4; // share of GETs that are public (not personalized) and can be edge-cached
 const CDN_TTL_S = 10;
@@ -60,6 +60,16 @@ export class World {
   private sampleAcc = 0;
   /** async work rejected downstream this tick, handed back to its source next tick (req/s by source id) */
   private rejected = new Map<number, number>();
+  /** queue id → how fast its workers may pull (jobs/s), and what they pulled last tick; paced to what the DB accepts */
+  private pace = new Map<number, { rate: number; pulled: number; back: number }>();
+  /** reads/s already routed to each replica this tick (several servers / caches share its room) */
+  private readsTo = new Map<number, number>();
+  /** legit reads/s each app server answered this tick (a lagging queue makes some of them stale) */
+  private serverReads = new Map<number, number>();
+  /** autoscaling groups: the CPU average the policy sees, and the scale-in cooldown */
+  /** groups already warned about an OOM cascade this wave (one log line, not one per instance) */
+  private oomSaid = new Set<number>();
+  private scaler = new Map<number, { work: number; cool: number; fresh?: boolean }>();
 
   constructor() {
     this.addNode('users', 80, 300, true);
@@ -83,8 +93,8 @@ export class World {
       this.money -= cost;
     }
     const n: SimNode = {
-      id: this.nextId++, kind, x, y, tier: 0, strategy: 'aside', cdnApi: false, pooler: false,
-      backlog: 0, downFor: 0, outage: 0, warm: 0, dirty: 0, pending: 0, resp: 0, inflight: 0, conns: 0,
+      id: this.nextId++, kind, x, y, tier: 0, strategy: 'aside', cdnApi: false, pooler: false, count: 1, auto: null, instDown: [],
+      backlog: 0, downFor: 0, outage: 0, warm: 0, dirty: 0, pending: 0, resp: 0, inflight: 0, conns: 0, room: -1,
       stats: blankStats(),
     };
     n.stats.cost = SPECS[kind].tiers[0].cost;
@@ -92,14 +102,23 @@ export class World {
     return n;
   }
 
-  resizeCost(n: SimNode, tier: number) { const ts = SPECS[n.kind].tiers; return Math.max(0, ts[tier].cost - ts[n.tier].cost); }
+  resizeCost(n: SimNode, tier: number) { const ts = SPECS[n.kind].tiers; return Math.max(0, ts[tier].cost - ts[n.tier].cost) * this.owned(n); }
+
+  /**
+   * Instances you bought (paid the first month up front, half back when sold). For an autoscaling group that's
+   * its minimum: instances it adds on its own are billed per second while they run, and nothing is paid or refunded for them.
+   */
+  owned(n: SimNode) { return n.auto ? n.auto.min : n.count; }
 
   upgradeCost(n: SimNode): number | null {
     return n.tier >= SPECS[n.kind].tiers.length - 1 ? null : this.resizeCost(n, n.tier + 1);
   }
 
   upgrade(n: SimNode): string | null {
-    if (n.tier >= SPECS[n.kind].tiers.length - 1) return 'Already the biggest size. Time to scale horizontally!';
+    if (n.tier >= SPECS[n.kind].tiers.length - 1)
+      return GROUPABLE.includes(n.kind) ? 'Already the biggest size. Add instances instead (scale out).'
+        : n.kind === 'database' ? 'Already the biggest size. Move reads to caches and replicas, or shard.'
+        : 'Already the biggest size. Add another one instead.';
     return this.resize(n, n.tier + 1);
   }
 
@@ -113,7 +132,10 @@ export class World {
     this.money -= c;
     const from = ts[n.tier].name;
     n.tier = tier;
-    if (this.phase === 'run' && RESIZE_S[n.kind] > 0 && n.downFor <= 0) {
+    if (this.phase === 'run' && this.isGroup(n)) {
+      // a group resizes as a rolling replacement: launch new-size instances, then terminate old ones, so it never stops serving
+      this.say(`${SPECS[n.kind].label} #${n.id}: rolling replacement ${from} → ${ts[tier].name} (new instances launch before old ones stop, no downtime)`, 'info');
+    } else if (this.phase === 'run' && RESIZE_S[n.kind] > 0 && n.downFor <= 0) {
       n.downFor = RESIZE_S[n.kind]; n.outage = 0; n.backlog = 0; n.inflight = 0;
       if (n.kind === 'cache') { n.warm = 0; n.dirty = 0; } // restart = empty cache (dirty keys flushed on graceful shutdown)
       this.say(`${SPECS[n.kind].label} #${n.id} restarting to resize ${from} → ${ts[tier].name} (~${RESIZE_S[n.kind]}s down)`, 'bad');
@@ -128,7 +150,161 @@ export class World {
   /** RDS Proxy bills per vCPU of the database it fronts (~$11/vCPU-month) */
   poolerCost(n: SimNode) { return n.pooler ? Math.round(11 * Math.max(2, this.tierOf(n).vcpu)) : 0; }
 
-  sellValue(n: SimNode) { return Math.floor(this.tierOf(n).cost * 0.5); }
+  sellValue(n: SimNode) { return Math.floor(this.tierOf(n).cost * 0.5) * this.owned(n); }
+
+  /** fixed $/month for every instance in the node */
+  fixedCost(n: SimNode) { return this.tierOf(n).cost * n.count + this.poolerCost(n); }
+
+  /**
+   * `k` instances of a group fail. A fixed group restarts them in place (`secs`). An autoscaling group terminates
+   * them and launches replacements right away, so the failed slots come back after the boot time and never linger.
+   */
+  private failInstances(n: SimNode, k: number, secs: number) {
+    for (let i = 0; i < k; i++) n.instDown.push(n.auto ? { t: BOOT_S, boot: true } : { t: secs });
+  }
+
+  /** several instances behind one node (or an autoscaling group): failures and resizes hit instances, not the node */
+  isGroup(n: SimNode) { return GROUPABLE.includes(n.kind) && (n.count > 1 || !!n.auto); }
+
+  /** instances currently serving traffic */
+  active(n: SimNode) { return n.downFor > 0 ? 0 : Math.max(0, n.count - n.instDown.length); }
+
+  /**
+   * Scale a group to `count` instances. Adding pays the first month for each new instance; mid-wave they
+   * boot for a few seconds before taking traffic. Removing refunds half, like selling.
+   */
+  setCount(n: SimNode, count: number): string | null {
+    if (!GROUPABLE.includes(n.kind)) return `${SPECS[n.kind].label} can't run as a group`;
+    count = Math.round(count);
+    if (count < 1) return 'A group needs at least one instance. Sell it instead.';
+    if (count > MAX_GROUP) return `Max ${MAX_GROUP} instances per group`;
+    const d = count - this.owned(n);
+    if (!d) return null;
+    const unit = this.tierOf(n).cost;
+    if (d > 0) {
+      if (this.money < unit * d) return `Need $${unit * d}`;
+      this.money -= unit * d;
+    } else this.money += Math.floor(unit * 0.5) * -d;
+    const a = n.auto;
+    if (a) {
+      // autoscaling: this sets the minimum; mid-wave the policy scales in to it on its own
+      a.min = count;
+      a.max = Math.max(a.max, count);
+      if (this.phase === 'build') n.count = count;
+      else if (count > n.count) this.launch(n, count - n.count);
+      return null;
+    }
+    if (d > 0) { if (this.phase === 'run') this.launch(n, d); else n.count = count; }
+    else {
+      n.instDown = n.instDown.slice(0, Math.max(0, count - 1)); // keep at least one serving
+      n.count = count;
+    }
+    return null;
+  }
+
+  /** Add instances to a group. Mid-wave they boot before taking traffic. */
+  private launch(n: SimNode, k: number) {
+    if (this.phase === 'run') for (let i = 0; i < k; i++) n.instDown.push({ t: BOOT_S, boot: true });
+    n.count += k;
+  }
+
+  /**
+   * Turn target tracking on or off. On: the current size becomes the minimum. Off: the group goes back to its
+   * minimum (the instances the policy added are terminated, not kept for free).
+   */
+  setAutoscale(n: SimNode, on: boolean): string | null {
+    if (!GROUPABLE.includes(n.kind)) return `${SPECS[n.kind].label} can't autoscale`;
+    if (on && !this.unlocked('autoscale')) return `Autoscaling unlocks at wave ${UNLOCKS.autoscale}`;
+    if (on === !!n.auto) return null;
+    if (on) n.auto = { min: n.count, max: Math.min(MAX_GROUP, Math.max(n.count * 3, n.count + 3)), target: 0.6 };
+    else {
+      const min = n.auto!.min;
+      n.auto = null;
+      this.scaleIn(n, n.count - min);
+    }
+    return null;
+  }
+
+  setAutoscaleLimits(n: SimNode, o: Partial<Pick<Autoscale, 'max' | 'target'>>) {
+    const a = n.auto;
+    if (!a) return;
+    if (o.max != null) a.max = clamp(Math.round(o.max), a.min, MAX_GROUP);
+    if (o.target != null) a.target = clamp(o.target, 0.2, 0.95);
+  }
+
+  /** Terminate `k` instances: crashed and still-booting ones go first, and at least one keeps serving. */
+  private scaleIn(n: SimNode, k: number) {
+    for (; k > 0 && n.count > 1; k--) {
+      const i = n.instDown.findIndex((d) => !d.boot);
+      const j = i >= 0 ? i : n.instDown.length - 1;
+      if (j >= 0) n.instDown.splice(j, 1);
+      else if (n.count - n.instDown.length <= 1) break;
+      n.count--;
+    }
+  }
+
+  /** Same-kind, same-size nodes collapse into one group; every link either of them had is kept. */
+  canMerge(ns: SimNode[]) {
+    return ns.length > 1 && GROUPABLE.includes(ns[0].kind) && ns.every((n) => n.kind === ns[0].kind && n.tier === ns[0].tier)
+      && ns.reduce((a, n) => a + n.count, 0) <= MAX_GROUP;
+  }
+
+  merge(ns: SimNode[]): SimNode | string {
+    if (!this.canMerge(ns)) return `Only ${GROUPABLE.map((k) => SPECS[k].label).join(' / ')} nodes of the same size can be grouped (max ${MAX_GROUP})`;
+    const [keep, ...rest] = ns;
+    for (const o of rest) {
+      for (const e of this.edges.filter((x) => x.to === o.id)) { const p = this.node(e.from); if (p && !rest.includes(p)) this.connect(p, keep); }
+      for (const e of this.edges.filter((x) => x.from === o.id)) { const c = this.node(e.to); if (c && !rest.includes(c)) this.connect(keep, c); }
+      // the merged group autoscales if either did; what each one owned becomes its minimum
+      if (o.auto && !keep.auto) keep.auto = { ...o.auto, min: keep.count };
+      if (keep.auto) { keep.auto.min += this.owned(o); keep.auto.max = Math.min(MAX_GROUP, Math.max(keep.auto.max, keep.auto.min)); }
+      keep.count += o.count;
+      keep.instDown.push(...o.instDown);
+      this.nodes = this.nodes.filter((x) => x !== o);
+      this.edges = this.edges.filter((e) => e.from !== o.id && e.to !== o.id);
+    }
+    return keep;
+  }
+
+  /** Give `to` the same incoming and outgoing links as `from` (where the wiring rules allow). Returns links made. */
+  copyWiring(from: SimNode, to: SimNode) {
+    let made = 0;
+    for (const e of this.edges.filter((x) => x.to === from.id)) { const p = this.node(e.from); if (p && !this.connect(p, to)) made++; }
+    for (const e of this.edges.filter((x) => x.from === from.id)) { const c = this.node(e.to); if (c && !this.connect(to, c)) made++; }
+    return made;
+  }
+
+  /** price of duplicating these nodes (same size, same group count) */
+  duplicateCost(ns: SimNode[]) { return ns.filter((n) => n.kind !== 'users').reduce((a, n) => a + this.tierOf(n).cost * this.owned(n), 0); }
+
+  /**
+   * Copy nodes (size, settings, group count) offset by dx/dy. Links to nodes outside the set are copied too,
+   * so a new server joins the same LB, cache and DB; links inside the set are rebuilt between the copies.
+   */
+  duplicate(ns: SimNode[], dx: number, dy: number): SimNode[] | string {
+    ns = ns.filter((n) => n.kind !== 'users');
+    if (!ns.length) return 'Nothing to duplicate';
+    for (const n of ns) if (!this.unlocked(n.kind)) return `${SPECS[n.kind].label} unlocks at wave ${UNLOCKS[n.kind]}`;
+    if (ns.some((n) => n.kind === 'database') && !this.unlocked('sharding'))
+      return `Only one primary database until sharding unlocks (wave ${UNLOCKS.sharding}). Add a read replica instead.`;
+    const cost = this.duplicateCost(ns);
+    if (this.money < cost) return `Need $${cost} to duplicate`;
+    this.money -= cost;
+    const map = new Map<number, SimNode>();
+    for (const n of ns) {
+      const c = this.addNode(n.kind, n.x + dx, n.y + dy, true) as SimNode;
+      Object.assign(c, { tier: n.tier, strategy: n.strategy, cdnApi: n.cdnApi, pooler: n.pooler, count: this.owned(n), auto: n.auto && { ...n.auto }, warm: 0 });
+      if (this.phase === 'run' && RESIZE_S[n.kind] > 0) c.downFor = RESIZE_S[n.kind]; // new instances boot before taking traffic
+      map.set(n.id, c);
+    }
+    for (const e of [...this.edges]) {
+      const a = map.get(e.from), b = map.get(e.to);
+      if (!a && !b) continue;
+      const from = a ?? this.node(e.from), to = b ?? this.node(e.to);
+      if (from && to) this.connect(from, to); // rules (e.g. one primary per replica) may refuse some: skip them
+    }
+    return [...map.values()];
+  }
 
   removeNode(id: number) {
     const n = this.node(id);
@@ -157,7 +333,22 @@ export class World {
     const err = this.canConnect(a, b);
     if (err) return err;
     this.edges.push({ id: this.nextId++, from: a.id, to: b.id, rps: zero(), sync: 0 });
+    this.linkReaders();
     return null;
+  }
+
+  /**
+   * Whoever reads from a primary also reads from its replicas (an app pointed at the cluster's reader
+   * endpoint), so Server → Database + Database → Replica is all the wiring a read/write split needs.
+   */
+  linkReaders() {
+    for (const d of this.nodes) {
+      if (d.kind !== 'database') continue;
+      const readers = this.parents(d).filter((p) => p.kind === 'server' || p.kind === 'cache');
+      for (const r of this.children(d, ['replica']))
+        for (const p of readers)
+          if (!this.canConnect(p, r)) this.edges.push({ id: this.nextId++, from: p.id, to: r.id, rps: zero(), sync: 0 });
+    }
   }
 
   private reaches(from: number, to: number): boolean {
@@ -188,13 +379,14 @@ export class World {
 
   edge(a: SimNode, b: SimNode) { return this.edges.find((e) => e.from === a.id && e.to === b.id); }
 
-  cap(n: SimNode) { return this.tierOf(n).cap; }
+  /** capacity of the whole node: per-instance capacity × instances in service */
+  cap(n: SimNode) { const c = this.tierOf(n).cap; return n.count > 1 || n.instDown.length ? c * this.active(n) : c; }
 
   /** replicas need a Database → Replica link */
   isSynced(rep: SimNode) { return this.parents(rep).some((p) => p.kind === 'database'); }
 
   /** $/month for the whole system right now (usage-based nodes priced at current traffic) */
-  burn() { return this.nodes.reduce((a, n) => a + (this.phase === 'run' ? n.stats.cost : this.tierOf(n).cost + this.poolerCost(n)), 0); }
+  burn() { return this.nodes.reduce((a, n) => a + (this.phase === 'run' ? n.stats.cost : this.fixedCost(n)), 0); }
 
   /** concurrent users the dataset has to serve this wave (data only grows) */
   peakUsers() { return this.wave.users ?? this.wave.peakRps * USERS_PER_RPS; }
@@ -247,6 +439,16 @@ export class World {
   }
 
   private endWave() {
+    // the rest of the month is off-peak: queues with a working consumer drain; without one, messages expire
+    for (const q of this.nodes) {
+      if (q.kind !== 'queue' || q.backlog < 1) continue;
+      const drains = this.children(q, ['worker']).some((k) => this.children(k, ['database']).length);
+      if (!drains) {
+        this.loseWrites(q.backlog);
+        this.say(`Queue #${q.id}: ${fmt(q.backlog)} messages nobody consumed expired (retention ran out). Those acknowledged writes are LOST.`, 'bad');
+      }
+      q.backlog = 0;
+    }
     const agg = this.waveAgg;
     const okRate = agg.req > 0 ? agg.ok / agg.req : 1;
     const bonus = Math.round(agg.earned * (okRate > 0.99 ? 0.25 : okRate > 0.95 ? 0.1 : 0));
@@ -257,9 +459,13 @@ export class World {
     this.wave = makeWave(this.waveNum);
     this.phase = 'build';
     for (const n of this.nodes) {
-      if (n.kind !== 'queue') n.backlog = 0;
-      n.downFor = 0; n.outage = 0; n.inflight = 0; n.pending = 0; n.dirty = 0;
+      n.backlog = 0;
+      n.downFor = 0; n.outage = 0; n.inflight = 0; n.pending = 0; n.dirty = 0; n.instDown = [];
+      if (n.auto) n.count = n.auto.min; // off-peak, autoscaling groups shrink back to their minimum
     }
+    this.pace.clear();
+    this.scaler.clear();
+    this.oomSaid.clear();
     this.say(`Month ${report.wave} books: earned $${Math.round(agg.earned).toLocaleString()}, cloud bill $${Math.round(agg.cost).toLocaleString()}${report.lostWrites >= 1 ? `, ${fmt(report.lostWrites)} acknowledged writes lost` : ''}`, report.lostWrites >= 1 ? 'bad' : 'info');
     this.say(`Wave ${report.wave} cleared! +$${bonus.toLocaleString()} bonus`, 'good');
     this.onWaveEnd?.(report);
@@ -279,6 +485,7 @@ export class World {
     this.time += dt;
 
     this.chaos(dt);
+    this.autoscale(dt);
 
     // demand
     const rps = w.peakRps * waveShape(w, this.time);
@@ -286,7 +493,9 @@ export class World {
 
     // reset
     for (const e of this.edges) { e.rps = zero(); e.sync = 0; }
-    for (const n of this.nodes) { const h = n.stats.hitRate; n.stats = blankStats(); n.stats.hitRate = h; n.stats.cost = this.tierOf(n).cost + this.poolerCost(n); }
+    this.serverReads.clear();
+    this.readsTo.clear();
+    for (const n of this.nodes) { const h = n.stats.hitRate; n.stats = blankStats(); n.stats.hitRate = h; n.stats.cost = this.fixedCost(n); }
 
     const inbox = new Map<number, Flow[]>();
     const push = (id: number, f: Flow) => {
@@ -336,7 +545,7 @@ export class World {
     // backpressure: hand rejected async work back to whoever owns it
     for (const [src, amt] of this.rejected) {
       const s = this.node(src);
-      if (s?.kind === 'queue') s.backlog += amt * dt;
+      if (s?.kind === 'queue') { s.backlog += amt * dt; const p = this.pace.get(src); if (p) p.back = amt; }
       else if (s?.kind === 'cache') s.dirty += (amt * dt) / WRITEBACK_COALESCE;
     }
     this.rejected.clear();
@@ -370,7 +579,7 @@ export class World {
     const revenue = success * REVENUE_PER_RPS_MONTH;
     const m = this.metrics;
     const a = 0.3; // smoothing
-    m.demand = demandLegit;
+    m.demand = m.demand * (1 - a) + demandLegit * a;
     m.success = m.success * (1 - a) + success * a;
     m.errors = m.errors * (1 - a) + errors * a;
     m.errorRate = m.errorRate * (1 - a) + errorRate * a;
@@ -395,6 +604,7 @@ export class World {
     let hurt = 0;
     if (m.errorRate > SLA.errorRate) hurt += Math.min(10, m.errorRate * 100) * 0.4;
     if (m.p99 > SLA.p99) hurt += Math.min(2, 1 + (m.p99 - SLA.p99) / 2000);
+    if (m.staleRate > SLA.stale) hurt += Math.min(1, (m.staleRate - SLA.stale) * 4); // "I posted it and it's gone": milder than errors
     if (hurt > 0) this.reputation -= hurt * dt;
     else this.reputation = Math.min(100, this.reputation + 0.4 * dt);
 
@@ -416,16 +626,32 @@ export class World {
     if (this.time >= w.duration) this.endWave();
   }
 
+  /** Acknowledged writes that never reached the DB. Users were told it worked: costs ~1 reputation per second of write traffic lost. */
+  private loseWrites(n: number) {
+    if (n <= 0) return;
+    this.metrics.lostWrites += n;
+    const wps = Math.max(1, this.wave.peakRps * this.wave.mix.w);
+    this.reputation = Math.max(1, this.reputation - Math.min(15, n / wps));
+  }
+
   private reject(src: number, wps: number) { this.rejected.set(src, (this.rejected.get(src) ?? 0) + wps); }
 
   /** Instance goes down. Caches lose their contents (and any unflushed write-back data). */
   private crash(n: SimNode, secs: number, why: string) {
-    n.downFor = secs; n.outage = 0; n.backlog = 0; n.inflight = 0;
+    if (n.auto) {
+      // an autoscaling group never goes down as a node: its serving instances fail health checks, and the policy
+      // launches replacements for them right away (instances still booting weren't serving, so they survive)
+      this.failInstances(n, this.active(n), secs);
+      n.backlog = 0; n.inflight = 0;
+      this.say(`${SPECS[n.kind].label} #${n.id} ${why.replace(/\s*Restarting\.\.\.$/, '')} The group replaces it (~${BOOT_S}s to boot).`, 'bad');
+      return;
+    }
+    n.downFor = secs; n.outage = 0; n.backlog = 0; n.inflight = 0; n.instDown = [];
     let extra = '';
     if (n.kind === 'cache') {
       n.warm = 0;
       if (n.dirty > 0.5) {
-        this.metrics.lostWrites += n.dirty;
+        this.loseWrites(n.dirty);
         extra = ` ${fmt(n.dirty)} acknowledged writes were still unflushed in write-back mode: LOST.`;
       }
       n.dirty = 0;
@@ -433,14 +659,85 @@ export class World {
     this.say(`${SPECS[n.kind].label} #${n.id} ${why}${extra}`, 'bad');
   }
 
+  /**
+   * Target tracking (AWS ASG style): desired = ceil(serving × load per instance / target), clamped to [min, max]. Scale-out
+   * launches instances right away, but they boot before taking traffic; instances still booting count toward desired,
+   * so it doesn't launch twice for the same load. Scale-in is slower: half the excess per step, after a cooldown.
+   * It only sees a smoothed metric, so a spike faster than the boot time is over before help arrives.
+   */
+  /**
+   * The policy's metric: work arriving per serving instance, as a share of what one can handle (like ALB
+   * RequestCountPerTarget). Unlike CPU it keeps rising past 100% when overloaded, so one step scales to the right size.
+   */
+  private loadPerInstance(n: SimNode) {
+    const st = n.stats;
+    return st.cpu * (st.servedRps > 0 ? Math.max(1, st.inRps / st.servedRps) : 1);
+  }
+
+  private autoscale(dt: number) {
+    for (const n of this.nodes) {
+      const a = n.auto;
+      if (!a) continue;
+      const s = this.scaler.get(n.id) ?? { work: 0, cool: AUTOSCALE_IN_COOLDOWN_S, fresh: true };
+      this.scaler.set(n.id, s);
+      s.cool = Math.max(0, s.cool - dt);
+      const serving = this.active(n);
+      if (s.fresh) {
+        // first datapoint of the month: the group tracked the off-peak traffic before this, so it is already
+        // the size that load needs (those instances were running, not booting)
+        const st = n.stats;
+        if (!serving || st.inRps <= 0) continue;
+        s.fresh = false;
+        s.work = serving * this.loadPerInstance(n);
+        const start = clamp(Math.ceil(s.work / a.target - 1e-6), a.min, a.max);
+        if (start > n.count) n.count = start;
+        continue;
+      }
+      // while every instance is down there's no new datapoint: the policy acts on the last one it saw
+      // smooth the total work (in instances' worth of capacity), not the per-instance load: total demand doesn't jump
+      // when booted instances come online, so the policy doesn't count the same overload twice
+      if (serving) s.work += (serving * this.loadPerInstance(n) - s.work) * Math.min(1, dt / AUTOSCALE_SMOOTH_S);
+      const work = s.work;
+      const want = clamp(Math.ceil(work / a.target - 1e-6), a.min, a.max);
+      // scale in only to a size that would still sit below ~90% of the target, so it doesn't flap back out
+      const keep = clamp(Math.ceil(work / (a.target * 0.9) - 1e-6), a.min, a.max);
+      // crashed instances are unhealthy: they don't count toward capacity, so the group replaces them now
+      // (once they recover, the extra instances get scaled back in, crashed ones first)
+      const failed = n.instDown.filter((d) => !d.boot).length;
+      const healthy = n.count - failed;
+      if (want > healthy) {
+        const k = want - healthy;
+        // at max size, replacements take the failed instances' slots (terminate them first)
+        for (let over = n.count + k - a.max; over > 0; over--) {
+          const i = n.instDown.findIndex((d) => !d.boot);
+          if (i < 0) break;
+          n.instDown.splice(i, 1);
+          n.count--;
+        }
+        this.launch(n, k);
+        s.cool = AUTOSCALE_IN_COOLDOWN_S;
+        this.say(`${SPECS[n.kind].label} #${n.id}: load ${pct(work / Math.max(1, serving))} per instance (target ${pct(a.target)}), autoscaling launched ${k} instance${k > 1 ? 's' : ''} (${n.count} total, booting ~${BOOT_S}s)`, 'info');
+      } else if (keep < n.count && serving && s.cool <= 0 && !n.instDown.some((d) => d.boot)) {
+        this.scaleIn(n, Math.ceil((n.count - keep) / 2)); // close half the gap per step: cautious, but not stuck oversized
+        s.cool = AUTOSCALE_IN_COOLDOWN_S;
+      }
+    }
+  }
+
   private chaos(dt: number) {
     const w = this.wave;
     if (w.chaos > 0 && Math.random() < w.chaos * dt) {
       // random instance failure: mostly app servers, sometimes a cache node
-      const pool = this.nodes.filter((n) => n.downFor <= 0 && (n.kind === 'server' || (n.kind === 'cache' && Math.random() < 0.35)));
+      // independent failures are weeks apart and a replacement takes minutes, so two rarely overlap in one group:
+      // skip groups still replacing a crashed instance (a lone server has no such luck)
+      const pool = this.nodes.filter((n) => n.downFor <= 0 && !n.instDown.some((d) => !d.boot) && (n.kind === 'server' || (n.kind === 'cache' && Math.random() < 0.35)));
       if (pool.length) {
         const v = pool[Math.floor(Math.random() * pool.length)];
-        this.crash(v, 8 + Math.random() * 6, v.kind === 'cache' ? 'crashed (node failure). It comes back empty: every read is a miss.' : 'crashed (instance failure). Restarting...');
+        if (v.count > 1 && this.active(v) > 1) {
+          // one instance of a group dies; the LB's health checks route around it
+          this.failInstances(v, 1, 8 + Math.random() * 6);
+          this.say(`${SPECS[v.kind].label} #${v.id}: 1 of ${v.count} instances crashed. The rest absorb its traffic while ${v.auto ? `a replacement boots (~${BOOT_S}s)` : 'it restarts'}.`, 'bad');
+        } else this.crash(v, 8 + Math.random() * 6, v.kind === 'cache' ? 'crashed (node failure). It comes back empty: every read is a miss.' : 'crashed (instance failure). Restarting...');
       }
     }
     const e = w.event;
@@ -451,6 +748,13 @@ export class World {
         const reps = this.children(db, ['replica']);
         this.say(`Primary database #${db.id} hardware failure! Writes fail${reps.length ? `; replica #${reps[0].id} gets promoted in ~${FAILOVER_S}s` : ` for ${e.len}s (no replica to fail over to)`}.`, 'bad');
       }
+    }
+    for (const n of this.nodes) if (n.instDown.length) {
+      for (const d of n.instDown) d.t -= dt;
+      const back = n.instDown.filter((d) => d.t <= 0 && !d.boot).length;
+      n.instDown = n.instDown.filter((d) => d.t > 0);
+      if (!n.instDown.length) this.oomSaid.delete(n.id); // recovered: a new cascade gets logged again
+      if (back) this.say(`${SPECS[n.kind].label} #${n.id}: instance back up (${this.active(n)}/${n.count} serving)`, 'good');
     }
     for (const n of this.nodes) if (n.downFor > 0) {
       n.downFor -= dt;
@@ -470,7 +774,7 @@ export class World {
       [db.tier, rep.tier] = [rep.tier, db.tier];
       rep.downFor = db.downFor; rep.outage = 0; rep.pending = 0; rep.backlog = 0;
       db.downFor = 0; db.outage = 0; db.backlog = 0;
-      this.metrics.lostWrites += lost;
+      this.loseWrites(lost);
       this.say(`Failover: replica #${rep.id} promoted to primary (the DB endpoint now points at it). ${lost >= 1 ? `${fmt(lost)} writes it hadn't replicated yet were lost.` : 'It was caught up, so nothing was lost.'} The failed box is rebuilt as the replica.`, lost >= 1 ? 'bad' : 'good');
     }
   }
@@ -524,10 +828,59 @@ export class World {
     });
   }
 
-  private hotWeights(targets: SimNode[]) {
-    if (this.wave.event?.type === 'hotkey' && targets.length > 1)
-      return targets.map((_, i) => (i === 0 ? targets.length - 1 : 1)); // first shard takes ~50%
-    return undefined;
+  /** The shard that owns the celebrity's key during a hot-key event: the first primary. */
+  private hotShard() { return this.nodes.find((n) => n.kind === 'database'); }
+
+  /**
+   * Hot key: a fixed share of the traffic is for ONE key, so its shard takes that share plus its even cut of
+   * the rest. More shards shrink the even cut but never the hot share (1 shard: 100%, 2: 68%, 4: 51%, 8: 43%).
+   * `shards` are primaries; undefined weights mean an even split.
+   */
+  private hotWeights(shards: SimNode[]) {
+    const hot = this.hotShard();
+    if (this.wave.event?.type !== 'hotkey' || shards.length < 2 || !hot || !shards.includes(hot)) return undefined;
+    const even = (1 - HOT_KEY_SHARE) / shards.length;
+    return shards.map((d) => (d === hot ? HOT_KEY_SHARE + even : even));
+  }
+
+  /**
+   * Reads go to the shard that owns the key (an even split, skewed by a hot key unless a cache in front
+   * absorbs the hot key's reads), then across that shard's live primary + replicas by capacity. A replica
+   * only holds its own shard's rows, so it can't take reads for another shard.
+   */
+  private spreadReads(io: IO, from: SimNode, flows: Flow[], hotKey: boolean) {
+    const shards = new Map<SimNode, SimNode[]>();
+    for (const c of this.children(from, ['database', 'replica'])) {
+      const primary = c.kind === 'database' ? c : this.parents(c).find((p) => p.kind === 'database');
+      if (!primary) continue; // not replicating: holds no data
+      if (!shards.has(primary)) shards.set(primary, []);
+      if (c.downFor <= 0) shards.get(primary)!.push(c);
+    }
+    if (!shards.size) return false;
+    const keys = [...shards.keys()];
+    const ws = (hotKey && this.hotWeights(keys)) || keys.map(() => 1 / keys.length);
+    keys.forEach((d, i) => {
+      const fs = flows.map((f) => part(f, null, ws[i]));
+      const live = shards.get(d)!;
+      const reps = live.filter((c) => c.kind === 'replica'), primary = live.find((c) => c.kind === 'database');
+      if (!live.length) io.drop(from, fs, `Shard #${d.id} is down with no replica: reads for its keys fail`);
+      else if (!reps.length || !primary) io.spread(from, fs, live, live.map((c) => this.cap(c))); // nothing to split
+      else {
+        // read/write split: replicas take the reads (up to what replaying writes leaves them), so the
+        // primary's capacity goes to writes; only overflow from undersized replicas reaches the primary
+        const want = sum(fs, total);
+        const room = reps.map((r) => Math.max(0, (r.room < 0 ? this.cap(r) * 0.85 : r.room) - (this.readsTo.get(r.id) ?? 0)));
+        const free = room.reduce((a, b) => a + b, 0);
+        const toReps = Math.min(want, free);
+        if (toReps > 0) reps.forEach((r, j) => {
+          const k = (toReps * room[j]) / free / want;
+          this.readsTo.set(r.id, (this.readsTo.get(r.id) ?? 0) + want * k);
+          for (const f of fs) io.send(from, r, part(f, null, k));
+        });
+        if (want > toReps) for (const f of fs) io.send(from, primary, part(f, null, 1 - toReps / want));
+      }
+    });
+    return true;
   }
 
   private weight(n: SimNode) { const c = this.cap(n); return isFinite(c) ? c : 1e6; }
@@ -541,9 +894,9 @@ export class World {
     st.inRps = total(inMix);
     const usage = (reqPerSec: number) => { if (tier.perM) st.cost += (tier.perM * reqPerSec * SECONDS_PER_MONTH) / 1e6; };
 
-    if (n.downFor > 0) {
+    if (n.downFor > 0 || ((n.count > 1 || n.instDown.length) && !this.active(n))) {
       if (n.kind === 'replica') n.pending += sum(flows.filter((f) => f.async), (m) => m.w) * dt; // catches up from WAL after restart
-      io.drop(n, n.kind === 'replica' ? flows.filter((f) => !f.async) : flows, `DOWN (${Math.ceil(n.downFor)}s)`);
+      io.drop(n, n.kind === 'replica' ? flows.filter((f) => !f.async) : flows, n.downFor > 0 ? `DOWN (${Math.ceil(n.downFor)}s)` : 'Every instance is down');
       this.describe(n);
       return;
     }
@@ -567,26 +920,44 @@ export class World {
     // ---- queue: ingest acks writes, then drains to workers
     if (n.kind === 'queue') {
       const cap = this.cap(n);
+      const lat = tier.lat ?? spec.latency;
+      const workers = this.children(n, ['worker']).filter((x) => x.downFor <= 0);
+      const workerCap = workers.reduce((a, x) => a + this.cap(x), 0);
+      // Workers block on the DB: when it pushed jobs back last tick, they only get through what it accepted.
+      // Otherwise they ramp back up toward full speed.
+      const p = this.pace.get(n.id) ?? { rate: workerCap, pulled: 0, back: 0 };
+      p.rate = p.back > 0 ? Math.max(workerCap * 0.02, (p.pulled - p.back) * 1.05) : Math.min(workerCap, p.rate * 1.3 + workerCap * 0.02);
+      p.back = 0;
+      const pull = Math.min(workerCap, p.rate);
+      // a full queue refuses new messages (the producer gets an error), it never silently drops acknowledged ones
+      const maxBacklog = cap * spec.queueSeconds;
+      const room = Math.max(0, maxBacklog - n.backlog) / dt + pull;
       const ingest = flows.filter((f) => !f.async);
       const inW = sum(ingest, total);
-      const keep = inW > cap ? cap / inW : 1;
-      if (keep < 1) io.drop(n, ingest.map((f) => part(f, null, 1 - keep)), 'Ingest limit hit');
-      for (const f of ingest) io.done.push(part(f, null, keep, spec.latency));
+      const limit = Math.min(cap, room);
+      const keep = inW > limit ? limit / inW : 1;
+      if (keep < 1) io.drop(n, ingest.map((f) => part(f, null, 1 - keep)), limit < cap ? 'Queue full: refusing writes' : 'Ingest limit hit');
+      for (const f of ingest) io.done.push(part(f, null, keep, lat));
       n.backlog += inW * keep * dt;
-      const workers = this.children(n, ['worker']).filter((x) => x.downFor <= 0);
-      const pull = workers.reduce((a, x) => a + this.cap(x), 0);
       const drained = Math.min(n.backlog, pull * dt);
+      p.pulled = drained / dt;
+      this.pace.set(n.id, p);
       n.backlog -= drained;
-      const maxBacklog = cap * spec.queueSeconds;
-      if (n.backlog > maxBacklog) { n.backlog = maxBacklog; st.note = 'Queue full!'; }
       st.util = st.cpu = inW / cap;
       st.servedRps = inW * keep;
-      st.latency = spec.latency;
+      st.latency = lat;
       usage(inW);
       if (drained > 0) io.spread(n, [{ mix: { s: 0, r: 0, w: drained / dt, b: 0 }, lat: 0, async: true, src: n.id }], workers, workers.map((x) => this.cap(x)));
-      if (!this.children(n, ['worker']).length) st.note = 'No workers: backlog grows forever';
-      else if (n.backlog > pull * 5) st.note = `Backlog ${Math.round(n.backlog / Math.max(1, pull))}s behind`;
-      this.describe(n, { pull });
+      const eta = pull < workerCap * 0.1 ? workerCap : pull; // while the DB is down, assume it drains at full speed once it's back
+      // until a queued write lands, reads don't see it (and cache-aside re-caches the old row after the server's DEL)
+      const lag = (st.lag = n.backlog / Math.max(1, workers.length ? pull : inW) + 0.05); // with no consumer: age of the oldest message
+      for (const s of this.parents(n)) {
+        const qs = this.children(s, ['queue']).filter((q) => q.downFor <= 0).length || 1;
+        st.stale += ((this.serverReads.get(s.id) ?? 0) / qs) * FRESH_READ_SHARE * ASYNC_WRITE_SHARE * (1 - Math.exp(-lag * 0.15));
+      }
+      if (!this.children(n, ['worker']).length) st.note = 'No workers: messages pile up until they expire';
+      else if (n.backlog > eta * 5) st.note = `Backlog ${Math.round(n.backlog / Math.max(1, eta))}s behind${pull < workerCap * 0.9 ? ' (DB is the limit)' : ''}`;
+      this.describe(n, { pull: eta });
       return;
     }
 
@@ -626,8 +997,13 @@ export class World {
     let hit = 0;
     const buf = isDb ? this.bufferPool(n) : null;
     const liveR = sum(live, rd), liveW = sum(live, (m) => m.w);
-    if (n.kind === 'server') units = (fs) => sum(fs, (m) => m.s * SERVER_STATIC_CPU + m.r + m.b + m.w);
-    if (n.kind === 'database') units = (fs) => sum(fs, (m) => rd(m) + m.w * spec.writeCost);
+    if (n.kind === 'server') {
+      const queued = this.children(n, ['queue']).some((q) => q.downFor <= 0);
+      const wCpu = queued ? ASYNC_WRITE_SHARE * ENQUEUE_CPU + (1 - ASYNC_WRITE_SHARE) : 1; // queued writes: validate + enqueue only
+      units = (fs) => sum(fs, (m) => m.s * SERVER_STATIC_CPU + m.r + m.b + m.w * wCpu);
+    }
+    const batched = (f: Flow) => !!f.async && f.src != null && this.node(f.src)?.kind === 'queue';
+    if (n.kind === 'database') units = (fs) => fs.reduce((a, f) => a + rd(f.mix) + f.mix.w * (batched(f) ? BATCH_WRITE_COST : spec.writeCost), 0);
     if (n.kind === 'cache') {
       const reads = liveR;
       const wr = reads > 0 ? (liveW + sum(ops, total)) / reads : 0;
@@ -637,17 +1013,17 @@ export class World {
     }
     if (tier.net && (n.kind === 'server' || n.kind === 'loadbalancer' || n.kind === 'ratelimiter')) {
       dim = sum(pass, (m) => m.s * STATIC_KB + (m.r + m.w + m.b) * API_KB) / 1000;
-      dimCap = tier.net; dimName = 'NIC';
+      dimCap = tier.net * Math.max(1, this.active(n)); dimName = 'NIC';
     }
     if (n.kind === 'loadbalancer' || n.kind === 'ratelimiter') base = tier.vcpu ? 0.5 : spec.latency;
     let applyNeed = 0;
     if (buf) {
       const miss = 1 - buf.hit;
       base += miss * PAGES_PER_READ * DISK_MS;
-      const bgW = sum(bg, (m) => m.w);
+      const bgB = bg.filter(batched).reduce((a, f) => a + f.mix.w, 0), bgW = sum(bg, (m) => m.w) - bgB;
       n.pending += sum(repl, (m) => m.w) * dt;
       applyNeed = n.pending * REPLICA_APPLY_COST; // work units to catch up fully
-      dim = liveR * miss * PAGES_PER_READ + (liveW + bgW) * 1.5 + Math.min(applyNeed / dt, cap) / REPLICA_APPLY_COST;
+      dim = liveR * miss * PAGES_PER_READ + (liveW + bgW) * 1.5 + bgB * BATCH_WRITE_IOPS + Math.min(applyNeed / dt, cap) / REPLICA_APPLY_COST;
       dimCap = tier.iops!; dimName = 'disk';
       st.hitRate = buf.hit;
     }
@@ -671,8 +1047,14 @@ export class World {
     const spare = Math.max(0, effCap * dt - reserve - served);
     const bgFrac = bgLoad > 0 ? Math.min(1, spare / (bgLoad * dt)) : 0;
     let applied = 0;
-    if (n.kind === 'replica') { applied = Math.min(applyNeed, reserve + spare); n.pending = Math.max(0, n.pending - applied / REPLICA_APPLY_COST); }
+    if (n.kind === 'replica') {
+      applied = Math.min(applyNeed, reserve + spare); n.pending = Math.max(0, n.pending - applied / REPLICA_APPLY_COST);
+      const room = Math.max(0, effCap * 0.85 - sum(repl, (m) => m.w) * REPLICA_APPLY_COST); // a saturated disk shrinks effCap too
+      n.room = n.room < 0 ? room : n.room * 0.7 + room * 0.3;
+    }
     const used = served / dt + bgLoad * bgFrac + applied / dt;
+    // what the work is spent on, for the inspector (live reads vs writes vs replaying the primary's writes)
+    const work = isDb ? { r: liveR * passFrac, w: (load - liveR) * passFrac + bgLoad * bgFrac, wps: liveW * passFrac + sum(bg, (m) => m.w) * bgFrac, repl: applied / dt } : undefined;
     const u = isFinite(cap) ? Math.max(used / effCap, uDim) : 0;
     st.util = u;
     st.cpu = isFinite(cap) ? Math.min(used, cap) / cap : 0;
@@ -687,6 +1069,11 @@ export class World {
       st.note = 'Throttling async writes (backpressure)';
     } else if (u > 0.9) st.note = uDim > uCpu ? (dimName === 'NIC' ? 'NIC almost saturated' : 'Disk-bound: working set > RAM') : 'Running hot';
     const out = live.map((f) => part(f, null, passFrac, nodeLat));
+    let surcharge = 0;
+    if (tier.baseline != null && tier.surplus) {
+      surcharge = Math.max(0, st.cpu - tier.baseline) * tier.vcpu * Math.max(1, this.active(n)) * HOURS_PER_MONTH * tier.surplus;
+      st.cost += surcharge;
+    }
 
     // ---- routing
     switch (n.kind) {
@@ -708,9 +1095,12 @@ export class World {
           fwd = out.map((f) => ({ ...f, mix: { s: f.mix.s * (1 - hs), r: f.mix.r * (1 - hr), w: f.mix.w, b: f.mix.b * (1 - hr) }, lat: f.lat + GEO[f.geo ?? 0].rtt * 0.85 }));
         }
         const kids = this.children(n);
-        const up = kids.filter((k) => k.downFor <= 0); // health checks: skip crashed backends
+        const up = kids.filter((k) => this.active(k) > 0); // health checks: skip crashed backends
         if (!kids.length) io.drop(n, fwd, n.kind === 'cdn' ? 'No origin: misses fail' : 'No downstream connection!');
-        else if (!up.length) io.drop(n, fwd, 'All backends down!');
+        else if (!up.length) {
+          const boot = Math.min(...kids.flatMap((k) => k.instDown.filter((d) => d.boot).map((d) => d.t)));
+          io.drop(n, fwd, isFinite(boot) ? `All backends down: replacements still booting (~${Math.ceil(boot)}s). Run 2+ instances so one failure isn't an outage` : 'All backends down!');
+        }
         else io.spread(n, fwd, up, up.map((k) => this.weight(k)));
         break;
       }
@@ -725,18 +1115,22 @@ export class World {
         if (!this.children(n, ['database', 'replica', 'cache', 'queue']).length) { io.drop(n, [...reads, ...writes], 'No database connected: reads/writes fail'); break; }
         // reads: cache first (keys sharded across caches by memory); if every cache is down, straight to the DB
         if (caches.length) io.spread(n, reads, caches, ramW(caches));
-        else if (rt.length) { io.spread(n, reads, rt, rt.map((c) => this.cap(c))); if (cacheKids.length) st.note = 'Cache down: every read hits the DB'; }
+        else if (rt.length) { this.spreadReads(io, n, reads, true); if (cacheKids.length) st.note = 'Cache down: every read hits the DB'; }
         else io.drop(n, reads, cacheKids.length ? 'Cache down and no DB link to fall back to' : 'No healthy place to read from');
         // writes
         const qs = this.children(n, ['queue']).filter((c) => c.downFor <= 0);
         const wt = this.writeTargets(n);
         const thru = caches.filter((c) => c.strategy === 'writethrough' || c.strategy === 'writeback');
         const inval = caches.filter((c) => c.strategy === 'aside' || c.strategy === 'readthrough');
-        if (qs.length) io.spread(n, writes, qs);
-        else if (thru.length) io.spread(n, writes, thru, ramW(thru));
-        else if (wt.length) this.spreadWrites(io, n, writes);
-        else if (cacheKids.some((c) => c.strategy === 'writethrough' || c.strategy === 'writeback')) io.drop(n, writes, 'Write cache is down: writes fail');
-        else io.drop(n, writes, this.children(n, ['database']).length ? 'Primary DB down: writes fail' : inval.length ? `${CACHE_STRATEGIES[inval[0].strategy].label}: writes need a Server → Database link` : 'No primary DB for writes');
+        // only some writes can wait (posts, likes, order intake); payments and unique/stock checks stay synchronous
+        const syncW = qs.length ? writes.map((f) => part(f, null, 1 - ASYNC_WRITE_SHARE)) : writes;
+        if (qs.length) io.spread(n, writes.map((f) => part(f, null, ASYNC_WRITE_SHARE)), qs);
+        if (thru.length) io.spread(n, syncW, thru, ramW(thru));
+        else if (wt.length) this.spreadWrites(io, n, syncW);
+        else if (cacheKids.some((c) => c.strategy === 'writethrough' || c.strategy === 'writeback')) io.drop(n, syncW, 'Write cache is down: writes fail');
+        else if (qs.length && !this.children(n, ['database']).length) io.drop(n, syncW, `~${pct(1 - ASYNC_WRITE_SHARE)} of writes can't wait (payments, unique checks): connect Server → Database`);
+        else io.drop(n, syncW, this.children(n, ['database']).length ? 'Primary DB down: writes fail' : inval.length ? `${CACHE_STRATEGIES[inval[0].strategy].label}: writes need a Server → Database link` : 'No primary DB for writes');
+        this.serverReads.set(n.id, sum(out, (m) => m.r));
         // cache-aside / read-through: invalidate the key after writing (DEL op)
         const wps = sum(writes, (m) => m.w);
         if (inval.length && wps > 0 && !thru.length) io.spread(n, [{ mix: { s: 0, r: 0, w: wps, b: 0 }, lat: 0, async: true }], inval, ramW(inval));
@@ -755,12 +1149,12 @@ export class World {
           ps.forEach((p, i) => {
             const fs = misses.map((f) => part(f, null, shares[i] / tot));
             const rt = this.readTargets(p);
-            if (rt.length) io.spread(p, fs, rt, rt.map((c) => this.cap(c)));
+            if (rt.length) this.spreadReads(io, p, fs, false); // the hot key itself stays cached: misses are the long tail
             else io.drop(n, fs, 'Cache-aside miss: Server has no DB link');
           });
         } else {
           const rt = this.readTargets(n);
-          if (rt.length) io.spread(n, misses, rt, rt.map((c) => this.cap(c)));
+          if (rt.length) this.spreadReads(io, n, misses, false);
           else io.drop(n, misses, `${CACHE_STRATEGIES[n.strategy].label}: connect Cache → Database`);
         }
         const writes = out.map((f) => part(f, ['w']));
@@ -791,7 +1185,7 @@ export class World {
         }
         if (n.kind === 'replica') {
           const lag = (st.lag = this.lag(n, sum(repl, (m) => m.w)));
-          st.stale += sum(out, rd) * (1 - Math.exp(-lag * 0.15));
+          st.stale += sum(out, (m) => m.r) * FRESH_READ_SHARE * (1 - Math.exp(-lag * 0.15));
         } else {
           // async replication: ship every committed write to each replica
           const reps = this.children(n, ['replica']);
@@ -807,7 +1201,7 @@ export class World {
         break;
       }
     }
-    this.describe(n, { hit, buf, dim, dimCap, dimName, uCpu, uDim });
+    this.describe(n, { hit, buf, dim, dimCap, dimName, uCpu, uDim, surcharge, work });
   }
 
   /** replication lag in seconds: un-applied writes / incoming write rate (plus ~20ms of shipping) */
@@ -828,11 +1222,23 @@ export class World {
       const now = n.downFor > 0 ? 0 : n.stats.servedRps * (n.resp / 1000) + n.backlog;
       n.inflight = n.inflight * 0.7 + now * 0.3;
       const baseGB = 0.4 + 0.1 * t.ram;
-      n.stats.ram = n.downFor > 0 ? 0 : baseGB + (n.inflight * REQ_MB) / 1024;
-      n.stats.ramWhy = `${gb(baseGB)} OS + runtime, plus ${fmt(n.inflight)} in-flight requests × ${REQ_MB} MB. In-flight = ${fmt(n.stats.servedRps)} req/s × ${ms(n.resp)} response time (Little's law), so a slow DB fills RAM.`;
-      n.stats.rows.splice(n.stats.rows[0]?.[0] === 'CPU' ? 1 : 0, 0, ['RAM', `${gb(n.stats.ram)} / ${gb(t.ram)}`, n.stats.ram > t.ram * 0.85], ['In-flight', fmt(n.inflight)]);
-      if (n.kind === 'server' && n.downFor <= 0 && n.stats.ram > t.ram)
-        this.crash(n, OOM_RESTART_S, `OOM-killed: ${fmt(n.inflight)} requests in flight (${ms(n.resp)} each) needed ${gb(n.stats.ram)} of ${gb(t.ram)} RAM. Restarting...`);
+      const inst = Math.max(1, this.active(n)), each = n.inflight / inst; // a group shares the load evenly
+      const per = n.count > 1 ? ' per instance' : '';
+      n.stats.ram = n.downFor > 0 ? 0 : baseGB + (each * REQ_MB) / 1024;
+      n.stats.ramWhy = `${gb(baseGB)} OS + runtime, plus ${fmt(each)} in-flight requests × ${REQ_MB} MB${per}. In-flight = ${fmt(n.stats.servedRps)} req/s × ${ms(n.resp)} response time (Little's law)${n.count > 1 ? `, split over ${inst} instances` : ''}, so a slow DB fills RAM.`;
+      n.stats.rows.splice(n.stats.rows[0]?.[0] === 'CPU' ? 1 : 0, 0, [`RAM${per}`, `${gb(n.stats.ram)} / ${gb(t.ram)}`, n.stats.ram > t.ram * 0.85], ['In-flight', fmt(n.inflight)]);
+      if (n.count > 1) n.stats.rows.unshift(['Instances', `${this.active(n)} / ${n.count} serving`, this.active(n) < n.count]);
+      if (n.kind !== 'server' || n.downFor > 0 || n.stats.ram <= t.ram) continue;
+      const why = `OOM-killed: ${fmt(each)} requests in flight per instance (${ms(n.resp)} each) needed ${gb(n.stats.ram)} of ${gb(t.ram)} RAM.`;
+      if (this.isGroup(n) && this.active(n) > 1) {
+        // instances never fill up in the same instant: the most loaded one dies first, its in-flight requests fail,
+        // and the LB moves its traffic to the rest, which pushes them closer to the limit (a cascade over a few seconds)
+        this.failInstances(n, 1, OOM_RESTART_S);
+        n.inflight = Math.max(0, n.inflight - each);
+        const left = this.active(n);
+        if (!this.oomSaid.has(n.id)) this.say(`${SPECS[n.kind].label} #${n.id}: an instance was ${why} Its traffic moves to the other ${left}, which are just as full: they will follow unless load drops or capacity arrives.`, 'bad');
+        this.oomSaid.add(n.id);
+      } else this.crash(n, OOM_RESTART_S, `${why} Restarting...`);
     }
     for (const d of this.nodes) {
       if (d.kind !== 'database' && d.kind !== 'replica') continue;
@@ -844,7 +1250,8 @@ export class World {
         if (p.kind === 'database') { conns += 1; continue; } // replication stream
         const need = total(e.rps) * (d.resp / 1000);
         const vc = Math.max(2, this.tierOf(p).vcpu);
-        conns += clamp(Math.ceil(need * 1.5), 10 * vc, 40 * vc); // one pool per process, ~10 conns per vCPU minimum
+        const procs = Math.max(1, p.count - p.instDown.length);
+        conns += clamp(Math.ceil(need * 1.5), 10 * vc * procs, 40 * vc * procs); // one pool per process, ~10 conns per vCPU minimum
         needed += need;
       }
       if (d.pooler) conns = Math.min(conns, Math.ceil(needed * 1.2) + 20);
@@ -853,7 +1260,7 @@ export class World {
   }
 
   /** Inspector rows + RAM explanation for a node. */
-  private describe(n: SimNode, x: { hit?: number; buf?: ReturnType<World['bufferPool']> | null; dim?: number; dimCap?: number; dimName?: string; uCpu?: number; uDim?: number; pull?: number } = {}) {
+  private describe(n: SimNode, x: { hit?: number; buf?: ReturnType<World['bufferPool']> | null; dim?: number; dimCap?: number; dimName?: string; uCpu?: number; uDim?: number; pull?: number; surcharge?: number; work?: { r: number; w: number; wps: number; repl: number } } = {}) {
     const st = n.stats, t = this.tierOf(n), rows = st.rows;
     const R = (k: string, v: string, bad?: boolean) => rows.push([k, v, bad]);
     if (x.dimCap) R(x.dimName === 'NIC' ? 'Network' : 'Disk IOPS', x.dimName === 'NIC' ? `${fmt(x.dim!)} / ${fmt(x.dimCap)} MB/s` : `${fmt(x.dim!)} / ${fmt(x.dimCap)}`, x.dim! > x.dimCap * 0.9);
@@ -866,6 +1273,12 @@ export class World {
         st.ramWhy = `Page cache ${gb(b.pool)} vs working set ${gb(b.ws)} (hot rows + indexes for ${fmt(this.peakUsers())} users${this.nodes.filter((q) => q.kind === 'database').length > 1 ? ', this shard' : ''}). ${b.ws > b.pool ? `It doesn't fit: ${pct(1 - b.hit)} of page reads go to disk.` : 'It fits: reads come from memory.'} Connections: ${fmt(n.conns)} × ${PG_CONN_MB} MB = ${gb(b.connGB)}.`;
         rows.unshift(['RAM', `${gb(st.ram)} / ${gb(t.ram)}`, b.ws > b.pool], ['Page hits', pct(b.hit), b.hit < 0.9]);
         R('Connections', `${fmt(n.conns)} / ${fmt(maxC)}`, n.conns > maxC * 0.85);
+        const wk = x.work, c = this.cap(n);
+        if (wk && c > 0) {
+          R('CPU on reads', `${pct(wk.r / c)} · ${fmt(wk.r)}/s`);
+          if (n.kind === 'database') R('CPU on writes', `${pct(wk.w / c)} · ${fmt(wk.wps)}/s (a write ≈ ${SPECS.database.writeCost}× a read)`, wk.w > c * 0.6);
+          else R('CPU replaying', `${pct(wk.repl / c)} · ${fmt(wk.repl / REPLICA_APPLY_COST)} writes/s from the primary`, wk.repl > c * 0.5);
+        }
         if (n.pooler) R('Pooler', 'RDS Proxy');
         if (n.kind === 'replica') {
           const lag = st.lag;
@@ -887,6 +1300,8 @@ export class World {
       }
       case 'queue': {
         R('Backlog', `${fmt(n.backlog)} msgs`, n.backlog > 1000);
+        R('Write lag', st.lag >= 1 ? `${st.lag.toFixed(1)}s` : `${Math.round(st.lag * 1000)}ms`, st.lag > 1);
+        if (st.stale > 0.5) R('Stale reads', `${fmt(st.stale)}/s`, true);
         if (x.pull) R('Oldest msg', `${ms((n.backlog / x.pull) * 1000)}`, n.backlog / x.pull > 5);
         break;
       }
@@ -896,6 +1311,7 @@ export class World {
     }
     if (n.kind !== 'users' && isFinite(t.cap)) rows.unshift(['CPU', pct(Math.min(1, st.cpu)), st.cpu > 0.85]);
     if (t.perM) R('Bill', `$${Math.round(st.cost).toLocaleString()}/mo`);
+    if (t.baseline != null) R('CPU credits', x.surcharge! >= 1 ? `+$${Math.round(x.surcharge!).toLocaleString()}/mo above ${pct(t.baseline)} baseline` : `within ${pct(t.baseline)} baseline`, x.surcharge! > t.cost);
   }
 }
 
