@@ -509,6 +509,21 @@ export class World {
     return this.children(n, ['database']).filter((c) => c.downFor <= 0);
   }
 
+  /**
+   * Writes go to the shard that owns the key. A shard whose primary is down fails its share (async work is
+   * handed back to its source) instead of spilling onto the other shards, which don't hold those rows.
+   */
+  private spreadWrites(io: IO, from: SimNode, flows: Flow[]) {
+    const shards = this.children(from, ['database']);
+    const ws = this.hotWeights(shards) ?? shards.map(() => 1);
+    const s = ws.reduce((a, b) => a + b, 0) || 1;
+    shards.forEach((d, i) => {
+      const fs = flows.map((f) => part(f, null, ws[i] / s));
+      if (d.downFor > 0) io.drop(from, fs, from.kind === 'worker' ? `Shard #${d.id} primary down: its jobs go back to the queue` : `Shard #${d.id} primary down: writes for its keys fail`);
+      else for (const f of fs) io.send(from, d, f);
+    });
+  }
+
   private hotWeights(targets: SimNode[]) {
     if (this.wave.event?.type === 'hotkey' && targets.length > 1)
       return targets.map((_, i) => (i === 0 ? targets.length - 1 : 1)); // first shard takes ~50%
@@ -719,7 +734,7 @@ export class World {
         const inval = caches.filter((c) => c.strategy === 'aside' || c.strategy === 'readthrough');
         if (qs.length) io.spread(n, writes, qs);
         else if (thru.length) io.spread(n, writes, thru, ramW(thru));
-        else if (wt.length) io.spread(n, writes, wt, this.hotWeights(wt));
+        else if (wt.length) this.spreadWrites(io, n, writes);
         else if (cacheKids.some((c) => c.strategy === 'writethrough' || c.strategy === 'writeback')) io.drop(n, writes, 'Write cache is down: writes fail');
         else io.drop(n, writes, this.children(n, ['database']).length ? 'Primary DB down: writes fail' : inval.length ? `${CACHE_STRATEGIES[inval[0].strategy].label}: writes need a Server → Database link` : 'No primary DB for writes');
         // cache-aside / read-through: invalidate the key after writing (DEL op)
@@ -751,7 +766,7 @@ export class World {
         const writes = out.map((f) => part(f, ['w']));
         const wt = this.writeTargets(n);
         if (n.strategy === 'writethrough') {
-          if (wt.length) io.spread(n, writes, wt, this.hotWeights(wt));
+          if (wt.length) this.spreadWrites(io, n, writes);
           else io.drop(n, writes, 'Write-through: connect Cache → Database (primary)');
         } else if (n.strategy === 'writeback') {
           for (const f of writes) io.done.push(f);
@@ -762,7 +777,7 @@ export class World {
           if (wt.length) {
             const flush = Math.min(n.dirty, n.dirty * dt + 1);
             n.dirty -= flush;
-            io.spread(n, [{ mix: { s: 0, r: 0, w: (flush / dt) * WRITEBACK_COALESCE, b: 0 }, lat: 0, async: true, src: n.id }], wt, this.hotWeights(wt));
+            this.spreadWrites(io, n, [{ mix: { s: 0, r: 0, w: (flush / dt) * WRITEBACK_COALESCE, b: 0 }, lat: 0, async: true, src: n.id }]);
           } else st.note = 'Write-back has no DB to flush to!';
         }
         break;
@@ -787,7 +802,7 @@ export class World {
       }
       case 'worker': {
         const wt = this.writeTargets(n);
-        if (wt.length) io.spread(n, out, wt, this.hotWeights(wt));
+        if (wt.length) this.spreadWrites(io, n, out);
         else io.drop(n, out, this.children(n).length ? 'Primary DB down: jobs go back to the queue' : 'No database to write to');
         break;
       }
