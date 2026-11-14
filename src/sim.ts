@@ -1,5 +1,5 @@
 import {
-  API_KB, ASYNC_WRITE_SHARE, AUTOSCALE_IN_COOLDOWN_S, AUTOSCALE_SMOOTH_S, BOOT_S, BATCH_WRITE_COST, BATCH_WRITE_IOPS, CACHE_HOT_MB_PER_USER, ENQUEUE_CPU, FRESH_READ_SHARE, HOT_KEY_SHARE, HOURS_PER_MONTH, GROUPABLE, MAX_GROUP, CACHE_STRATEGIES, CACHE_USABLE, DB_HOT_MB_PER_USER, DISK_MS, FAILOVER_S, GEO, OOM_RESTART_S, PAGES_PER_READ,
+  API_KB, ASYNC_WRITE_SHARE, AUTOSCALE_IN_COOLDOWN_S, AUTOSCALE_SMOOTH_S, BOOT_S, BATCH_WRITE_COST, BATCH_WRITE_IOPS, CACHE_HOT_MB_PER_USER, ENQUEUE_CPU, FRESH_READ_SHARE, HOT_KEY_SHARE, HOURS_PER_MONTH, INFRA_BUDGET_SHARE, GROUPABLE, MAX_GROUP, CACHE_STRATEGIES, CACHE_USABLE, DB_HOT_MB_PER_USER, DISK_MS, FAILOVER_S, GEO, OOM_RESTART_S, PAGES_PER_READ,
   PG_CONN_MB, REPLICA_APPLY_COST, REQ_MB, RESIZE_S, REVENUE_PER_RPS_MONTH, SECONDS_PER_MONTH, SLA, SPECS, START_MONEY, STATIC_KB, TICK,
   TIMEOUT_MS, UNLOCKS, USERS_PER_RPS, WRITEBACK_COALESCE, makeWave, maxConnections, waveShape, zipfHit,
 } from './config';
@@ -451,7 +451,8 @@ export class World {
     }
     const agg = this.waveAgg;
     const okRate = agg.req > 0 ? agg.ok / agg.req : 1;
-    const bonus = Math.round(agg.earned * (okRate > 0.99 ? 0.25 : okRate > 0.95 ? 0.1 : 0));
+    // a clean month earns a budget top-up on top of the usual share of revenue
+    const bonus = Math.round(agg.earned * INFRA_BUDGET_SHARE * (okRate > 0.99 ? 0.25 : okRate > 0.95 ? 0.1 : 0));
     this.money += bonus;
     const report: WaveReport = { wave: this.waveNum, served: agg.ok, okRate, earned: agg.earned, bonus, worstP99: agg.worstP99, cost: agg.cost, lostWrites: this.metrics.lostWrites };
     this.bestWave = Math.max(this.bestWave, this.waveNum);
@@ -466,7 +467,7 @@ export class World {
     this.pace.clear();
     this.scaler.clear();
     this.oomSaid.clear();
-    this.say(`Month ${report.wave} books: earned $${Math.round(agg.earned).toLocaleString()}, cloud bill $${Math.round(agg.cost).toLocaleString()}${report.lostWrites >= 1 ? `, ${fmt(report.lostWrites)} acknowledged writes lost` : ''}`, report.lostWrites >= 1 ? 'bad' : 'info');
+    this.say(`Month ${report.wave} books: revenue $${Math.round(agg.earned).toLocaleString()}, your ${Math.round(INFRA_BUDGET_SHARE * 100)}% budget $${Math.round(agg.earned * INFRA_BUDGET_SHARE).toLocaleString()}, cloud bill $${Math.round(agg.cost).toLocaleString()} (${agg.earned > 0 ? Math.round((agg.cost / agg.earned) * 100) : 0}% of revenue)${report.lostWrites >= 1 ? `, ${fmt(report.lostWrites)} acknowledged writes lost` : ''}`, report.lostWrites >= 1 ? 'bad' : 'info');
     this.say(`Wave ${report.wave} cleared! +$${bonus.toLocaleString()} bonus`, 'good');
     this.onWaveEnd?.(report);
   }
@@ -590,9 +591,9 @@ export class World {
     m.upkeep = upkeep;
     m.revenue = revenue;
 
-    // one wave = one month: $/month rates are paid out over the wave's duration
+    // one wave = one month: $/month rates are paid out over the wave's duration. You get your share of revenue, not all of it
     const k = dt / w.duration;
-    this.money += (revenue - upkeep) * k;
+    this.money += (revenue * INFRA_BUDGET_SHARE - upkeep) * k;
     this.totalServed += success * dt;
     this.waveAgg.req += demandLegit * dt;
     this.waveAgg.ok += success * dt;

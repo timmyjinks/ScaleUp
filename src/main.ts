@@ -1,5 +1,5 @@
 import './style.css';
-import { AUTOSCALE_TARGETS, BOOT_S, CACHE_STRATEGIES, GEO, GROUPABLE, MAX_GROUP, PALETTE_ORDER, RESIZE_S, SLA, SPECS, TICK, UNLOCKS, USERS_PER_RPS, waveRps } from './config';
+import { AUTOSCALE_TARGETS, BOOT_S, CACHE_STRATEGIES, GEO, GROUPABLE, INFRA_BUDGET_SHARE, MAX_GROUP, PALETTE_ORDER, RESIZE_S, SLA, SPECS, TICK, UNLOCKS, USERS_PER_RPS, waveRps } from './config';
 import { advise } from './advisor';
 import { fieldGuideButtonHtml, guideButtonHtml, initGuide, lessonDiagramsHtml, mountMiniDiagrams, setPlacingHint } from './guideview';
 import { NODE_H, NODE_W, Renderer, drawIcon, type ViewState } from './render';
@@ -17,6 +17,12 @@ const view: ViewState = { selectedNode: null, selected: [], box: null, selectedE
 let speed = 1;
 const lessonsSeen = new Set<number>();
 const quick = new Set<string>();
+/** tutorial tips: lesson pop-ups, the get-started checklist, palette hover cards and the placement hint. A per-browser preference */
+let tips = (() => { try { return localStorage.getItem('tips') !== 'off'; } catch { return true; } })();
+function setTips(on: boolean) {
+  tips = on;
+  try { localStorage.setItem('tips', on ? 'on' : 'off'); } catch { /* ignore */ }
+}
 
 // ------------------------------------------------------------------ helpers
 
@@ -386,7 +392,7 @@ function refreshHud() {
     !running ? '' : m.p99 > SLA.p99 ? 'bad' : m.p99 > SLA.p99 * 0.6 ? 'warn' : 'good');
   setStat('s-err', running ? (m.errorRate * 100).toFixed(m.errorRate < 0.1 ? 2 : 1) + '%' : '—', running ? `${fmt(m.errors)} failing/s${m.staleRate > 0.005 ? ` · ${(m.staleRate * 100).toFixed(1)}% stale reads` : ''}` : `SLA < ${SLA.errorRate * 100}%`,
     !running ? '' : m.errorRate > SLA.errorRate ? 'bad' : m.errorRate > SLA.errorRate / 3 || m.staleRate > SLA.stale ? 'warn' : 'good');
-  const net = m.revenue - m.upkeep;
+  const net = m.revenue * INFRA_BUDGET_SHARE - m.upkeep;
   setStat('s-money', money(Math.floor(world.money)), running ? `${net >= 0 ? '+' : ''}${money(net)}/mo net` : `bill ${money(world.burn())}/mo`, world.money < 0 ? 'bad' : '');
   const rep = $('#s-rep .meter i');
   rep.style.width = `${world.reputation}%`;
@@ -470,6 +476,32 @@ window.addEventListener('pointerdown', (ev) => { pressed = (ev.target as Element
 window.addEventListener('pointerup', () => setTimeout(() => (pressed = null)), true); // after the click fires
 window.addEventListener('pointercancel', () => (pressed = null), true);
 
+/**
+ * Panels redraw ~10x/s mid-wave, and a warning line or longer status text appearing moves every button below it.
+ * While the pointer is over a panel, a redraw that would move anything clickable is held back, so the button you
+ * are aiming at stays put. Text-only updates still show. After you act (click, key, edit), the redraw goes through.
+ */
+const hovered = new Set<Element>();
+let acted = false;
+for (const sel of ['#inspector', '#advisor']) {
+  const el = $(sel);
+  el.addEventListener('pointerenter', () => hovered.add(el));
+  el.addEventListener('pointerleave', () => hovered.delete(el));
+}
+window.addEventListener('keydown', () => (acted = true), true);
+const clickables = (el: Element) => [...el.querySelectorAll<HTMLElement>('[data-act], [data-node], [data-guide], input')]
+  .map((e) => { const r = e.getBoundingClientRect(); return `${e.dataset.act ?? ''}${e.dataset.v ?? ''}${e.dataset.node ?? ''}@${Math.round(r.left)},${Math.round(r.top)},${Math.round(r.width)},${Math.round(r.height)}`; }).join('|');
+/** Swap a panel's content; false if it was held back (try again next refresh). */
+function patchPanel(el: HTMLElement, html: string, fill?: (el: HTMLElement) => void) {
+  const hold = [...hovered].some((h) => h.contains(el)) && !acted;
+  const before = hold ? clickables(el) : '';
+  const old = hold ? [...el.childNodes] : [];
+  el.innerHTML = html;
+  fill?.(el);
+  if (hold && clickables(el) !== before) { el.replaceChildren(...old); return false; }
+  return true;
+}
+
 let inspectorHtml = '';
 function refreshInspector() {
   const el = $('#inspector');
@@ -546,11 +578,8 @@ function refreshInspector() {
       ${b?.kind === 'cache' || a?.kind === 'cache' ? '<p>Cache traffic includes GETs, SETs after a miss, and DELETEs (invalidations) after writes.</p>' : ''}
       <div class="row"><button class="btn danger" data-act="unlink">Remove connection</button></div>`;
   }
-  if (html !== inspectorHtml) {
+  if (html !== inspectorHtml && patchPanel(el, html, (p) => p.querySelectorAll<HTMLElement>('[data-icon]').forEach((x) => x.appendChild(iconCanvas(x.dataset.icon as NodeKind, 24)))))
     inspectorHtml = html;
-    el.innerHTML = html;
-    el.querySelectorAll<HTMLElement>('[data-icon]').forEach((x) => x.appendChild(iconCanvas(x.dataset.icon as NodeKind, 24)));
-  }
 }
 $('#inspector').addEventListener('change', (ev) => {
   const t = ev.target as HTMLInputElement;
@@ -563,6 +592,7 @@ $('#inspector').addEventListener('change', (ev) => {
     if (act === 'auto-max') world.setAutoscaleLimits(n, { max: v });
   }
   inspectorHtml = ''; // redraw with the value that actually stuck (clamped, or unchanged if it was refused)
+  acted = true;
 });
 $('#inspector').addEventListener('keydown', (ev) => {
   const t = ev.target as HTMLInputElement;
@@ -592,6 +622,7 @@ $('#inspector').addEventListener('click', (ev) => {
   if (act === 'pick') selectOnly(Number(v));
   if (act === 'unlink' && view.selectedEdge != null) { world.removeEdge(view.selectedEdge); view.selectedEdge = null; }
   inspectorHtml = '';
+  acted = true;
 });
 
 // ------------------------------------------------------------------ advisor / log / quickstart
@@ -600,7 +631,7 @@ let advisorHtml = '';
 function refreshAdvisor() {
   if (pressed === $('#advisor')) return;
   const html = advise(world).map((h) => `<li class="${h.level}" ${h.node ? `data-node="${h.node}"` : ''}>${h.text}</li>`).join('');
-  if (html !== advisorHtml) { advisorHtml = html; $('#advisor ul').innerHTML = html; }
+  if (html !== advisorHtml && patchPanel($('#advisor ul'), html)) advisorHtml = html;
 }
 $('#advisor').addEventListener('click', (ev) => {
   const id = (ev.target as HTMLElement).closest<HTMLElement>('[data-node]')?.dataset.node;
@@ -616,7 +647,7 @@ function refreshLog() {
 
 function refreshQuickstart() {
   const el = $('#quickstart');
-  if (world.waveNum > 1 || quick.has('start')) { if (el.innerHTML) el.innerHTML = ''; return; }
+  if (!tips || world.waveNum > 1 || quick.has('start')) { if (el.innerHTML) el.innerHTML = ''; return; }
   // also detect completion from actual graph state (e.g. if the player did things in another order)
   const servers = world.nodes.filter((n) => n.kind === 'server');
   if (servers.length) quick.add('server');
@@ -710,9 +741,12 @@ function lessonHtml(wave: number, l: Lesson) {
 
 function maybeShowLesson() {
   const l = LESSONS[world.waveNum];
-  if (!l || lessonsSeen.has(world.waveNum)) return false;
+  if (!tips || !l || lessonsSeen.has(world.waveNum)) return false;
   lessonsSeen.add(world.waveNum);
-  modal(lessonHtml(world.waveNum, l), [{ label: 'Got it', primary: true }]);
+  modal(lessonHtml(world.waveNum, l), [
+    { label: 'Skip tutorial', onClick: () => { setTips(false); toast('Tutorial tips off. Turn them back on in Menu; every lesson stays under ?', 'info'); } },
+    { label: 'Got it', primary: true },
+  ]);
   return true;
 }
 
@@ -738,6 +772,7 @@ function wireWorld() {
         <div><label>Worst p99</label><span>${ms(r.worstP99)}</span></div>
         <div><label>Bonus</label><span>+${money(r.bonus)}</span></div>
       </div>
+      <p style="color:var(--muted)">Revenue ${money(r.earned)} · your ${Math.round(INFRA_BUDGET_SHARE * 100)}% budget ${money(r.earned * INFRA_BUDGET_SHARE)} · cloud bill ${money(r.cost)} (<b style="color:${r.cost > r.earned * INFRA_BUDGET_SHARE ? 'var(--bad)' : 'inherit'}">${r.earned > 0 ? Math.round((r.cost / r.earned) * 100) : 0}% of revenue</b>)</p>
       <div class="next"><div class="eyebrow">Up next · wave ${next.index}</div>
         <p><b>${next.title}</b>: peak <b>${fmt(next.peakRps)} req/s</b> (~${fmt(next.peakRps * USERS_PER_RPS)} users), ${Math.round(next.peakRps / waveRps(r.wave) * 100 - 100)}% more than this wave.
         Mix: ${Math.round(next.mix.s * 100)}% static · ${Math.round(next.mix.r * 100)}% reads · ${Math.round(next.mix.w * 100)}% writes${next.mix.b ? ` · <span class="c-b">+${next.mix.b * 100}% bots</span>` : ''}.</p>
@@ -785,7 +820,8 @@ function frame(now: number) {
   if (uiAcc > 0.1) {
     uiAcc = 0;
     refreshHud(); refreshPalette(); refreshInspector(); refreshAdvisor(); refreshLog(); refreshQuickstart(); refreshCharts();
-    setPlacingHint(view.placing?.kind ?? null);
+    acted = false;
+    setPlacingHint(tips ? view.placing?.kind ?? null : null);
     saveSandbox.afterUi();
   }
   requestAnimationFrame(frame);
@@ -797,6 +833,7 @@ buildPalette();
 let guidePrevSpeed = 0;
 initGuide({
   unlocked: (f) => world.unlocked(f),
+  tips: () => tips,
   onModal: (open) => { if (open) { guidePrevSpeed = speed; if (world.phase === 'run') setSpeed(0); } else if (world.phase === 'run' && guidePrevSpeed) setSpeed(guidePrevSpeed); },
 });
 wireWorld();
@@ -805,7 +842,7 @@ renderer.resize();
 maybeShowLesson();
 // save/resume + sandbox (persist.ts, sandbox.ts, menu.ts)
 const saveSandbox = installSaveAndSandbox({
-  getWorld: () => world, getRenderer: () => renderer, reset, lessonsSeen, quick, modal, toast,
+  getWorld: () => world, getRenderer: () => renderer, reset, lessonsSeen, quick, modal, toast, tips: { on: () => tips, set: setTips },
   adopt: (w) => { world = w; renderer = new Renderer(canvas, world); renderer.resize(); selectOnly(null); view.placing = view.linking = null; wireWorld(); inspectorHtml = advisorHtml = ''; },
 });
 requestAnimationFrame(frame);

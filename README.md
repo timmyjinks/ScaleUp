@@ -16,7 +16,7 @@ npm run dev
 - **Replication:** Database → Replica is async. Replicas replay every write, lag when busy (stale reads), and get promoted ~15s after the primary dies (un-replicated writes are lost).
 - **Resizing** an instance mid-wave restarts it (8-15s down). Between waves it is instant.
 - **Databases** serve live traffic first. Async work (queue workers, write-back flushes, replication) gets the leftover capacity and is pushed back when there isn't enough (backpressure).
-- **SLA:** <1% errors and p99 <800ms. Breaking it drains reputation. Revenue (~$3 per req/s-month) pays the cloud bill.
+- **SLA:** <1% errors and p99 <800ms. Breaking it drains reputation. Revenue is ~$26 per req/s-month (≈ $10 per million requests), and finance gives you 15% of it as your cloud budget, the top of what a typical SaaS spends on hosting. A bill above that drains the budget. Tutorial tips can be turned off on any lesson card or in Menu.
 
 ## Curriculum
 | Wave | Peak req/s | Unlock | Event |

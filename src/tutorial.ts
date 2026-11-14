@@ -1,3 +1,4 @@
+import { INFRA_BUDGET_SHARE } from './config';
 import type { NodeKind } from './types';
 
 export interface Lesson {
@@ -16,7 +17,7 @@ export const LESSONS: Record<number, Lesson> = {
     body: [
       'Users are about to show up: ~1,000 people online, each sending a request every ~10s, so about <b>100 req/s</b>. Your job: <b>serve them</b> without breaking the SLA (<b>&lt;1% errors</b> and <b>p99 latency &lt;800ms</b>). Break it for too long and your reputation runs out.',
       'Traffic comes in types: <span class="c-s">●</span> static assets, <span class="c-r">●</span> reads, <span class="c-w">●</span> writes, and later <span class="c-b">●</span> bots. An App Server returns static files itself, but reads and writes need a <b>Database</b>.',
-      'The numbers are real-world ballparks. A <b>t3.small</b> ($15/mo) handles ~800 API req/s; a small Postgres handles a few thousand indexed reads/s. Each wave is <b>one month</b>: the bill is in $/month and grows with your traffic, and so does revenue.',
+      'The numbers are real-world ballparks. A <b>t3.small</b> ($15/mo) handles ~800 API req/s; a small Postgres handles a few thousand indexed reads/s. Each wave is <b>one month</b>: the bill is in $/month and grows with your traffic, and so does revenue. Finance gives you <b>' + Math.round(INFRA_BUDGET_SHARE * 100) + '% of revenue</b> as your cloud budget (a typical SaaS spends 5-15% on hosting; the rest pays salaries and everything else), so a bill bigger than that drains your budget.',
       '<b>Build:</b> pick a tool on the left and click the canvas to place it. Drag from a node\'s <b>right port</b> onto another node to connect them. Drag empty space to pan, scroll to zoom. Click a node to see its CPU, RAM and what to do with it.',
     ],
     interview: 'Start with the simplest thing that works: client → server → DB. Do the back-of-envelope math (users → req/s → servers) and ask "what breaks first as traffic grows?"',

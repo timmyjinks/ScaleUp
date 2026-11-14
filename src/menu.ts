@@ -128,6 +128,8 @@ export function installSaveAndSandbox(host: Host) {
       <button data-m="export">Export save (.json)</button>
       <button data-m="import">Import save…</button>
       <hr/>
+      <button data-m="tips">Tutorial tips: ${host.tips.on() ? 'on' : 'off'}</button>
+      <hr/>
       <button data-m="new">New game</button>
       ${mode === 'sandbox' ? '<button data-m="campaign">Back to campaign</button>' : '<button data-m="sandbox">Sandbox</button>'}`;
   }
@@ -164,6 +166,10 @@ export function installSaveAndSandbox(host: Host) {
       host.modal(`<div class="eyebrow">Import save</div><h2>Load this ${s.mode === 'sandbox' ? 'sandbox' : `run (wave ${s.world.waveNum})`}?</h2>
         <p>It replaces your current ${s.mode} save.</p>`,
         [{ label: 'Cancel' }, { label: 'Load', primary: true, onClick: () => { writeSlot(s); switchTo(s.mode, s); host.toast('Save imported', 'info'); } }]);
+    } else if (m === 'tips') {
+      const on = !host.tips.on();
+      host.tips.set(on);
+      host.toast(on ? 'Tutorial tips on: lessons pop up at the start of each new wave' : 'Tutorial tips off. Every lesson stays under ?', 'info');
     } else if (m === 'new') confirmNew();
     else if (m === 'sandbox') switchTo('sandbox', readSlot('sandbox'));
     else if (m === 'campaign') switchTo('campaign', readSlot('campaign'));

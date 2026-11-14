@@ -35,6 +35,8 @@ export interface Host {
   quick: Set<string>;
   modal(html: string, actions: { label: string; primary?: boolean; onClick?: () => void }[]): void;
   toast(text: string, kind?: 'bad' | 'info'): void;
+  /** tutorial tips preference (main.ts) */
+  tips: { on(): boolean; set(on: boolean): void };
 }
 
 export interface Snapshot {

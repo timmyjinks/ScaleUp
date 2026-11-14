@@ -9,10 +9,15 @@ export const START_MONEY = 120;
 // ---- economy: one wave is one month of business, compressed into `duration` seconds
 export const SECONDS_PER_MONTH = 2_628_000;
 /**
- * $ earned per month by 1 req/s of successfully served traffic (≈ $10 per million requests).
- * Ballpark for an ad- or subscription-funded web app, where the cloud bill is typically 5-15% of revenue.
+ * $ the company earns per month from 1 req/s of successfully served traffic (≈ $10 per million requests).
+ * Ballpark for an ad- or subscription-funded web app.
  */
 export const REVENUE_PER_RPS_MONTH = 26;
+/**
+ * Share of revenue that finance gives you as the cloud budget. The rest pays salaries, offices, marketing and margin:
+ * a typical SaaS spends 5-15% of revenue on hosting, so a bill above this share drains the budget.
+ */
+export const INFRA_BUDGET_SHARE = 0.15;
 
 // ---- physics (real-world ballparks)
 /** where users are: share of traffic, RTT to your datacenter, RTT to the nearest CDN edge (ms) */

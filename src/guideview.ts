@@ -20,6 +20,8 @@ interface GuideHost {
   unlocked: (feature: string) => boolean;
   /** called when the guide modal opens / closes (e.g. to pause the sim) */
   onModal?: (open: boolean) => void;
+  /** tutorial tips on? Off hides the palette hover cards */
+  tips?: () => boolean;
 }
 
 let host: GuideHost = { unlocked: () => true };
@@ -110,6 +112,7 @@ function placeFly(anchor: HTMLElement) {
 
 function showFly(key: GuideKey, anchor: HTMLElement) {
   clearTimeout(hideTimer);
+  if (host.tips && !host.tips()) return hideFly();
   if (flyKey !== key || fly.classList.contains('hidden')) renderFly(key);
   fly.classList.remove('hidden');
   placeFly(anchor);
