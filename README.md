@@ -18,6 +18,16 @@ npm run dev
 - **Databases** serve live traffic first. Async work (queue workers, write-back flushes, replication) gets the leftover capacity and is pushed back when there isn't enough (backpressure).
 - **SLA:** <1% errors and p99 <800ms. Breaking it drains reputation. Revenue is ~$26 per req/s-month (≈ $10 per million requests), and finance gives you 15% of it as your cloud budget, the top of what a typical SaaS spends on hosting. A bill above that drains the budget. Tutorial tips can be turned off on any lesson card or in Menu.
 
+## A note on abstraction
+ScaleUp is a learning and visualization tool, not a production-grade simulator. The goal is to show how a system behaves under real traffic and how it scales as that traffic grows, using real-world concepts. It isn't meant to model every detail.
+
+Some complicated parts are simplified or abstracted away so they don't distract from that goal. For example:
+- **Databases:** sharding (key distribution, rebalancing, cross-shard queries), indexes and query planning are reduced to capacity, IOPS and working-set numbers.
+- **Load balancing:** the concept (spreading traffic, health checks, failover) is shown, but algorithms, connection handling and L4/L7 details are simplified.
+- **CDNs:** edge caching and offload are modeled as hit rates, not as real PoPs, cache keys or invalidation.
+
+The numbers aim to be realistic enough that the lessons carry over to real systems.
+
 ## Curriculum
 | Wave | Peak req/s | Unlock | Event |
 |---|---|---|---|
